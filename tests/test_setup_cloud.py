@@ -20,8 +20,12 @@ class SetupCloudTests(unittest.TestCase):
             fake_bin.mkdir()
             shutil.copyfile(SCRIPT, scripts / SCRIPT.name)
 
-            mise_go = Path(directory) / "mise-go"
+            mise_bin = Path(directory) / "mise" / "bin"
+            mise_bin.mkdir(parents=True)
+            mise_go = mise_bin / "go"
+            mise_gofmt = mise_bin / "gofmt"
             self.write_executable(mise_go, "#!/bin/sh\necho 'go version go1.26.5 linux/amd64'\n")
+            self.write_executable(mise_gofmt, "#!/bin/sh\nexit 0\n")
             self.write_executable(
                 fake_bin / "go",
                 "#!/bin/sh\necho 'go version go1.24.3 linux/amd64'\n",
@@ -29,7 +33,11 @@ class SetupCloudTests(unittest.TestCase):
             self.write_executable(
                 fake_bin / "mise",
                 "#!/bin/sh\n"
-                "if [ \"$1\" = which ]; then printf '%s\\n' \"$FAKE_MISE_GO\"; fi\n",
+                "case \"$*\" in\n"
+                "  'install go@1.26.5'|'use --global go@1.26.5') ;;\n"
+                "  'which go --tool=go@1.26.5') printf '%s\\n' \"$FAKE_MISE_GO\" ;;\n"
+                "  *) echo \"unexpected mise arguments: $*\" >&2; exit 2 ;;\n"
+                "esac\n",
             )
             self.write_executable(
                 fake_bin / "claude",
@@ -51,8 +59,11 @@ class SetupCloudTests(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             pinned_go = project / ".tools" / "go" / "bin" / "go"
+            pinned_gofmt = project / ".tools" / "go" / "bin" / "gofmt"
             self.assertTrue(pinned_go.is_symlink())
+            self.assertTrue(pinned_gofmt.is_symlink())
             self.assertEqual(pinned_go.resolve(), mise_go.resolve())
+            self.assertEqual(pinned_gofmt.resolve(), mise_gofmt.resolve())
             version = subprocess.run(
                 [str(pinned_go), "version"],
                 text=True,
