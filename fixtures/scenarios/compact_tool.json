@@ -1,0 +1,10 @@
+{
+  "name": "compact_tool",
+  "sequence": [
+    "claude_code_mcp",
+    "compact_after",
+    "compact_after",
+    "compact_text_low",
+    "compact_text_low"
+  ]
+}

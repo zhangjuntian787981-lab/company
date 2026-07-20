@@ -1,0 +1,251 @@
+diff --git a/internal/translator/codex/claude/codex_claude_request.go b/internal/translator/codex/claude/codex_claude_request.go
+index 21732ff..ebc36bf 100644
+--- a/internal/translator/codex/claude/codex_claude_request.go
++++ b/internal/translator/codex/claude/codex_claude_request.go
+@@ -9,6 +9,7 @@ import (
+ 	"crypto/sha256"
+ 	"encoding/hex"
+ 	"fmt"
++	"path"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -134,6 +135,37 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+ 				hasContent = true
+ 			}
+ 
++			appendDocumentContent := func(part gjson.Result) {
++				if messageRole != "user" {
++					return
++				}
++				source := part.Get("source")
++				mediaType := source.Get("media_type").String()
++				filename := claudeDocumentFilename(part.Get("title").String(), mediaType)
++				switch source.Get("type").String() {
++				case "base64":
++					data := source.Get("data").String()
++					if data == "" {
++						return
++					}
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), "input_file")
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.file_data", contentIndex), data)
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.filename", contentIndex), filename)
++				case "url":
++					fileURL := source.Get("url").String()
++					if fileURL == "" {
++						return
++					}
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.type", contentIndex), "input_file")
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.file_url", contentIndex), fileURL)
++					message, _ = sjson.SetBytes(message, fmt.Sprintf("content.%d.filename", contentIndex), filename)
++				default:
++					return
++				}
++				contentIndex++
++				hasContent = true
++			}
++
+ 			appendReasoningContent := func(part gjson.Result) {
+ 				if messageRole != "assistant" {
+ 					return
+@@ -169,6 +201,8 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+ 						appendTextContent(messageContentResult.Get("text").String())
+ 					case "thinking":
+ 						appendReasoningContent(messageContentResult)
++					case "document":
++						appendDocumentContent(messageContentResult)
+ 					case "image":
+ 						sourceResult := messageContentResult.Get("source")
+ 						if sourceResult.Exists() {
+@@ -295,7 +329,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+ 			tool, _ = sjson.DeleteBytes(tool, "parameters.$schema")
+ 			tool, _ = sjson.DeleteBytes(tool, "cache_control")
+ 			tool, _ = sjson.DeleteBytes(tool, "defer_loading")
+-			tool, _ = sjson.SetBytes(tool, "strict", false)
++			strict := false
++			if value := toolResult.Get("strict"); value.Exists() {
++				strict = value.Bool()
++			}
++			tool, _ = sjson.SetBytes(tool, "strict", strict)
+ 			template, _ = sjson.SetRawBytes(template, "tools.-1", tool)
+ 		}
+ 	}
+@@ -308,6 +346,11 @@ func ConvertClaudeRequestToCodex(modelName string, inputRawJSON []byte, _ bool)
+ 
+ 	// Add additional configuration parameters for the Codex API.
+ 	template, _ = sjson.SetBytes(template, "parallel_tool_calls", parallelToolCalls)
++	if maxTokens := rootResult.Get("max_tokens"); maxTokens.Exists() {
++		template, _ = sjson.SetRawBytes(template, "max_output_tokens", []byte(maxTokens.Raw))
++	}
++	// The Codex Responses request schema has no stop or stop_sequences field.
++	// Keep Claude stop_sequences out of the upstream request rather than sending an invalid parameter.
+ 
+ 	// Convert thinking.budget_tokens to reasoning.effort.
+ 	reasoningEffort := "medium"
+@@ -368,6 +411,31 @@ func normalizeCodexServiceTier(result gjson.Result) string {
+ 	}
+ }
+ 
++func claudeDocumentFilename(title, mediaType string) string {
++	candidate := strings.TrimSpace(strings.ReplaceAll(title, "\\", "/"))
++	if candidate != "" {
++		candidate = path.Base(candidate)
++		if candidate != "." && candidate != "/" && candidate != ".." {
++			return candidate
++		}
++	}
++
++	extension := ".bin"
++	switch strings.ToLower(strings.TrimSpace(mediaType)) {
++	case "application/pdf":
++		extension = ".pdf"
++	case "application/json":
++		extension = ".json"
++	case "text/html":
++		extension = ".html"
++	case "text/markdown":
++		extension = ".md"
++	case "text/plain":
++		extension = ".txt"
++	}
++	return "document" + extension
++}
++
+ // shortenCodexCallIDIfNeeded keeps Claude tool IDs within the OpenAI Responses
+ // API call_id limit while preserving a stable, low-collision mapping.
+ func shortenCodexCallIDIfNeeded(id string) string {
+diff --git a/internal/translator/codex/claude/codex_claude_request_test.go b/internal/translator/codex/claude/codex_claude_request_test.go
+index 255694c..349f738 100644
+--- a/internal/translator/codex/claude/codex_claude_request_test.go
++++ b/internal/translator/codex/claude/codex_claude_request_test.go
+@@ -137,6 +137,130 @@ func TestConvertClaudeRequestToCodex_MessageSystemRoleWrapsAsUserReminder(t *tes
+ 	}
+ }
+ 
++func TestConvertClaudeRequestToCodex_DocumentContentMapping(t *testing.T) {
++	tests := []struct {
++		name          string
++		document      string
++		wantField     string
++		wantValue     string
++		wantFilename  string
++		unwantedField string
++	}{
++		{
++			name:          "Base64 PDF",
++			document:      `{"type":"document","title":"../report.pdf","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQ="}}`,
++			wantField:     "file_data",
++			wantValue:     "JVBERi0xLjQ=",
++			wantFilename:  "report.pdf",
++			unwantedField: "file_url",
++		},
++		{
++			name:          "URL PDF with generated filename",
++			document:      `{"type":"document","source":{"type":"url","media_type":"application/pdf","url":"https://example.com/report.pdf"}}`,
++			wantField:     "file_url",
++			wantValue:     "https://example.com/report.pdf",
++			wantFilename:  "document.pdf",
++			unwantedField: "file_data",
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			inputJSON := `{
++				"model":"claude-opus-4-8",
++				"messages":[{"role":"user","content":[
++					` + tt.document + `,
++					{"type":"text","text":"summarize"}
++				]}]
++			}`
++
++			result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
++			file := gjson.GetBytes(result, "input.0.content.0")
++			if got := file.Get("type").String(); got != "input_file" {
++				t.Fatalf("document type = %q, want input_file. Output: %s", got, result)
++			}
++			if got := file.Get(tt.wantField).String(); got != tt.wantValue {
++				t.Fatalf("document %s = %q, want %q. Output: %s", tt.wantField, got, tt.wantValue, result)
++			}
++			if got := file.Get("filename").String(); got != tt.wantFilename {
++				t.Fatalf("document filename = %q, want %q. Output: %s", got, tt.wantFilename, result)
++			}
++			if file.Get(tt.unwantedField).Exists() {
++				t.Fatalf("document unexpectedly contains %s. Output: %s", tt.unwantedField, result)
++			}
++			if got := gjson.GetBytes(result, "input.0.content.1.text").String(); got != "summarize" {
++				t.Fatalf("neighboring text = %q, want summarize. Output: %s", got, result)
++			}
++		})
++	}
++}
++
++func TestConvertClaudeRequestToCodex_ToolStrictMapping(t *testing.T) {
++	tests := []struct {
++		name       string
++		strictJSON string
++		want       bool
++	}{
++		{name: "Preserve strict true", strictJSON: `,"strict":true`, want: true},
++		{name: "Default strict false", want: false},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			inputJSON := `{
++				"model":"claude-opus-4-8",
++				"tools":[{
++					"name":"lookup",
++					"description":"Lookup",
++					"input_schema":{"type":"object","properties":{},"additionalProperties":false}
++					` + tt.strictJSON + `
++				}],
++				"messages":[{"role":"user","content":"hello"}]
++			}`
++
++			result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
++			strict := gjson.GetBytes(result, "tools.0.strict")
++			if !strict.Exists() {
++				t.Fatalf("tools.0.strict is missing. Output: %s", result)
++			}
++			if got := strict.Bool(); got != tt.want {
++				t.Fatalf("tools.0.strict = %v, want %v. Output: %s", got, tt.want, result)
++			}
++		})
++	}
++}
++
++func TestConvertClaudeRequestToCodex_MaxTokensMapping(t *testing.T) {
++	inputJSON := `{
++		"model":"claude-opus-4-8",
++		"max_tokens":321,
++		"messages":[{"role":"user","content":"hello"}]
++	}`
++
++	result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
++	if got := gjson.GetBytes(result, "max_output_tokens").Int(); got != 321 {
++		t.Fatalf("max_output_tokens = %d, want 321. Output: %s", got, result)
++	}
++	if gjson.GetBytes(result, "max_tokens").Exists() {
++		t.Fatalf("Claude max_tokens should not survive under its original name. Output: %s", result)
++	}
++}
++
++func TestConvertClaudeRequestToCodex_StopSequencesAreNotForwarded(t *testing.T) {
++	inputJSON := `{
++		"model":"claude-opus-4-8",
++		"stop_sequences":["END","DONE"],
++		"messages":[{"role":"user","content":"hello"}]
++	}`
++
++	result := ConvertClaudeRequestToCodex("gpt-5.6-sol", []byte(inputJSON), false)
++	for _, path := range []string{"stop", "stop_sequences"} {
++		if gjson.GetBytes(result, path).Exists() {
++			t.Fatalf("unsupported Codex Responses field %s was forwarded. Output: %s", path, result)
++		}
++	}
++}
++
+ func TestConvertClaudeRequestToCodex_ParallelToolCalls(t *testing.T) {
+ 	tests := []struct {
+ 		name                  string

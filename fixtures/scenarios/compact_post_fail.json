@@ -1,0 +1,10 @@
+{
+  "name": "compact_post_fail",
+  "sequence": [
+    "compact_after",
+    "compact_after",
+    "compact_text_low",
+    "http_500",
+    "compact_text_low"
+  ]
+}

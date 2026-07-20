@@ -1,0 +1,7 @@
+{
+  "name": "failed",
+  "status": 200,
+  "sse_events": [
+    {"event": "response.failed", "data": {"type": "response.failed", "response": {"id": "resp_failed", "status": "failed", "error": {"type": "server_error", "code": "synthetic_failure"}}}}
+  ]
+}

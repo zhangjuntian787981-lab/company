@@ -1,0 +1,14 @@
+{
+  "name": "claude_code_mcp_done",
+  "status": 200,
+  "sse_events": [
+    {"event": "response.created", "data": {"type": "response.created", "response": {"id": "resp_mcp_done", "object": "response", "status": "in_progress", "model": "claude_code_mcp", "output": []}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 0, "item": {"id": "msg_mcp_done", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}},
+    {"event": "response.content_part.added", "data": {"type": "response.content_part.added", "item_id": "msg_mcp_done", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}},
+    {"event": "response.output_text.delta", "data": {"type": "response.output_text.delta", "item_id": "msg_mcp_done", "output_index": 0, "content_index": 0, "delta": "mcp complete"}},
+    {"event": "response.output_text.done", "data": {"type": "response.output_text.done", "item_id": "msg_mcp_done", "output_index": 0, "content_index": 0, "text": "mcp complete"}},
+    {"event": "response.content_part.done", "data": {"type": "response.content_part.done", "item_id": "msg_mcp_done", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "mcp complete", "annotations": []}}},
+    {"event": "response.output_item.done", "data": {"type": "response.output_item.done", "output_index": 0, "item": {"id": "msg_mcp_done", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "mcp complete", "annotations": []}]}}},
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "resp_mcp_done", "object": "response", "status": "completed", "model": "claude_code_mcp", "output": [{"id": "msg_mcp_done", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": "mcp complete", "annotations": []}]}], "usage": {"input_tokens": 18, "output_tokens": 2, "total_tokens": 20}}}}
+  ]
+}

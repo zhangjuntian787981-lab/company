@@ -1,0 +1,18 @@
+{
+  "schema_version": 1,
+  "default_approved": [
+    "unit tests",
+    "loopback mock tests",
+    "hash-only production baseline checks",
+    "isolated process launch on dynamic ports"
+  ],
+  "not_approved_by_default": [
+    "any real upstream request",
+    "any connection to port 8317",
+    "reading credential values under ~/.cli-proxy-api",
+    "loading user settings, hooks, plugins, MCP, or project configuration",
+    "starting, stopping, signaling, or reconfiguring the production launchd label",
+    "credential rotation or deletion"
+  ],
+  "future_stage_requires_explicit_approval": true
+}

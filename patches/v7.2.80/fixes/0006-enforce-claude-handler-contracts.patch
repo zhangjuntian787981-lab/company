@@ -1,0 +1,2410 @@
+diff --git a/internal/api/server_test.go b/internal/api/server_test.go
+index 1f9c6a3..5dd7664 100644
+--- a/internal/api/server_test.go
++++ b/internal/api/server_test.go
+@@ -890,24 +890,18 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
+ 		}
+ 
+ 		var claudeModel map[string]any
+-		var rewrittenModel map[string]any
+ 		for _, m := range resp.Data {
+ 			id, _ := m["id"].(string)
+-			switch id {
+-			case "claude-sonnet-4-6":
++			if id == "claude-sonnet-4-6" {
+ 				claudeModel = m
+-			case "claude-fable-5-dd-o4-tpg":
+-				rewrittenModel = m
+-			case "gpt-4o", "claude-gpt-4o":
+-				t.Fatalf("expected non-claude model id to be rewritten as claude-fable-5-dd-<reversed>, got %q", id)
++			}
++			if id == "gpt-4o" || id == "claude-gpt-4o" || id == "claude-fable-5-dd-o4-tpg" {
++				t.Fatalf("non-Claude model leaked into Claude catalog as %q", id)
+ 			}
+ 		}
+ 		if claudeModel == nil {
+ 			t.Fatalf("expected claude-sonnet-4-6 in response, got %s", rr.Body.String())
+ 		}
+-		if rewrittenModel == nil {
+-			t.Fatalf("expected claude-fable-5-dd-o4-tpg in response, got %s", rr.Body.String())
+-		}
+ 		for _, field := range []string{"max_input_tokens", "max_tokens", "display_name"} {
+ 			if _, ok := claudeModel[field]; !ok {
+ 				t.Fatalf("expected Claude model to include %q, got %v", field, claudeModel)
+@@ -915,6 +909,42 @@ func TestModelsDispatchByAnthropicVersionHeader(t *testing.T) {
+ 		}
+ 	})
+ 
++	t.Run("claude cli user agent routes to filtered claude format", func(t *testing.T) {
++		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
++		req.Header.Set("Authorization", "Bearer test-key")
++		req.Header.Set("User-Agent", "claude-cli/2.1.215")
++
++		rr := httptest.NewRecorder()
++		server.engine.ServeHTTP(rr, req)
++		if rr.Code != http.StatusOK {
++			t.Fatalf("status = %d, want %d body=%s", rr.Code, http.StatusOK, rr.Body.String())
++		}
++		var resp struct {
++			Object  string           `json:"object"`
++			HasMore *bool            `json:"has_more"`
++			Data    []map[string]any `json:"data"`
++		}
++		if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
++			t.Fatalf("decode response: %v; body=%s", err, rr.Body.String())
++		}
++		if resp.Object == "list" || resp.HasMore == nil {
++			t.Fatalf("expected Claude catalog envelope: %s", rr.Body.String())
++		}
++		foundClaude := false
++		for _, model := range resp.Data {
++			id, _ := model["id"].(string)
++			if id == "claude-sonnet-4-6" {
++				foundClaude = true
++			}
++			if id == "gpt-4o" || strings.HasPrefix(id, "claude-fable-5-dd-") {
++				t.Fatalf("non-Claude model leaked into Claude CLI catalog as %q", id)
++			}
++		}
++		if !foundClaude {
++			t.Fatalf("expected claude-sonnet-4-6 in response: %s", rr.Body.String())
++		}
++	})
++
+ 	// Plain request (no Anthropic-Version, non-claude-cli User-Agent) -> OpenAI format, unaffected.
+ 	t.Run("plain request stays on openai format", func(t *testing.T) {
+ 		req := httptest.NewRequest(http.MethodGet, "/v1/models", nil)
+diff --git a/sdk/api/handlers/claude/code_handlers.go b/sdk/api/handlers/claude/code_handlers.go
+index cd31f19..ada368c 100644
+--- a/sdk/api/handlers/claude/code_handlers.go
++++ b/sdk/api/handlers/claude/code_handlers.go
+@@ -69,6 +69,24 @@ func withClaudeCountBudget(ctx context.Context) context.Context {
+ 	})
+ }
+ 
++func claudeRequestPolicyForRoute(rawJSON []byte) (*claudeRequestPolicy, error) {
++	model := strings.TrimSpace(gjson.GetBytes(rawJSON, "model").String())
++	baseModel := model
++	if suffix := strings.LastIndex(baseModel, "("); suffix > 0 && strings.HasSuffix(baseModel, ")") {
++		baseModel = strings.TrimSpace(baseModel[:suffix])
++	}
++	providers := registry.GetGlobalRegistry().GetModelProviders(baseModel)
++	if len(providers) == 0 {
++		return preflightClaudeRequest(rawJSON)
++	}
++	for _, provider := range providers {
++		if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
++			return &claudeRequestPolicy{rawJSON: rawJSON}, nil
++		}
++	}
++	return preflightClaudeRequest(rawJSON)
++}
++
+ // Models returns a list of models supported by this handler.
+ func (h *ClaudeCodeAPIHandler) Models() []map[string]any {
+ 	// Get dynamic models from the global registry
+@@ -98,13 +116,18 @@ func (h *ClaudeCodeAPIHandler) ClaudeMessages(c *gin.Context) {
+ 
+ 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
+ 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
++	policy, err := claudeRequestPolicyForRoute(rawJSON)
++	if err != nil {
++		h.writeClaudeRequestPolicyError(c, err)
++		return
++	}
+ 
+ 	// Check if the client requested a streaming response.
+-	streamResult := gjson.GetBytes(rawJSON, "stream")
++	streamResult := gjson.GetBytes(policy.rawJSON, "stream")
+ 	if !streamResult.Exists() || streamResult.Type == gjson.False {
+-		h.handleNonStreamingResponse(c, rawJSON)
++		h.handleNonStreamingResponse(c, policy)
+ 	} else {
+-		h.handleStreamingResponse(c, rawJSON)
++		h.handleStreamingResponse(c, policy)
+ 	}
+ }
+ 
+@@ -130,12 +153,20 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
+ 
+ 	// Decode claude-fable-5-dd-<reversed> model IDs back to the real model name for routing.
+ 	rawJSON = rewriteClaudeDDModelInBody(rawJSON)
++	policy, err := claudeRequestPolicyForRoute(rawJSON)
++	if err != nil {
++		h.writeClaudeRequestPolicyError(c, err)
++		return
++	}
++	rawJSON = policy.rawJSON
+ 
+ 	c.Header("Content-Type", "application/json")
+ 
+ 	alt := h.GetAlt(c)
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+-	cliCtx = withClaudeCountBudget(cliCtx)
++	if policy.codexRoute {
++		cliCtx = withClaudeCountBudget(cliCtx)
++	}
+ 
+ 	modelName := gjson.GetBytes(rawJSON, "model").String()
+ 
+@@ -171,12 +202,7 @@ func rewriteClaudeDDModelInBody(rawJSON []byte) []byte {
+ // Parameters:
+ //   - c: The Gin context for the request.
+ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
+-	models := h.Models()
+-	for i := range models {
+-		if id, ok := models[i]["id"].(string); ok {
+-			models[i]["id"] = util.EnsureClaudeModelIDPrefix(id)
+-		}
+-	}
++	models := claudeCatalogModels(h.Models())
+ 	sortClaudeModelsByDisplayName(models)
+ 	firstID := ""
+ 	lastID := ""
+@@ -197,6 +223,25 @@ func (h *ClaudeCodeAPIHandler) ClaudeModels(c *gin.Context) {
+ 	})
+ }
+ 
++func claudeCatalogModels(models []map[string]any) []map[string]any {
++	filtered := make([]map[string]any, 0, len(models))
++	for _, model := range models {
++		id, ok := model["id"].(string)
++		id = strings.TrimSpace(id)
++		lowerID := strings.ToLower(id)
++		if !ok || !strings.HasPrefix(lowerID, "claude-") || strings.HasPrefix(lowerID, "claude-fable-5-dd-") {
++			continue
++		}
++		copyModel := make(map[string]any, len(model))
++		for key, value := range model {
++			copyModel[key] = value
++		}
++		copyModel["id"] = id
++		filtered = append(filtered, copyModel)
++	}
++	return filtered
++}
++
+ // sortClaudeModelsByDisplayName sorts models by display_name ascending.
+ // When display_name is equal or missing, id is used as a stable tie-breaker.
+ func sortClaudeModelsByDisplayName(models []map[string]any) {
+@@ -221,11 +266,14 @@ func sortClaudeModelsByDisplayName(models []map[string]any) {
+ //   - c: The Gin context for the request
+ //   - modelName: The name of the Gemini model to use for content generation
+ //   - rawJSON: The raw JSON request body containing generation parameters and content
+-func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSON []byte) {
++func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, policy *claudeRequestPolicy) {
++	rawJSON := policy.rawJSON
+ 	c.Header("Content-Type", "application/json")
+ 	alt := h.GetAlt(c)
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+-	cliCtx = withClaudeGenerationBudget(cliCtx)
++	if policy.codexRoute {
++		cliCtx = withClaudeGenerationBudget(cliCtx)
++	}
+ 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+ 
+ 	modelName := gjson.GetBytes(rawJSON, "model").String()
+@@ -258,6 +306,12 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
+ 			}
+ 		}
+ 	}
++	resp, _, errConstraint := applyClaudeNonStreamingOutputConstraints(resp, policy.constraints)
++	if errConstraint != nil {
++		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: errConstraint})
++		cliCancel(errConstraint)
++		return
++	}
+ 
+ 	handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+ 	_, _ = c.Writer.Write(resp)
+@@ -271,7 +325,8 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
+ // Parameters:
+ //   - c: The Gin context for the request.
+ //   - rawJSON: The raw JSON request body.
+-func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON []byte) {
++func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, policy *claudeRequestPolicy) {
++	rawJSON := policy.rawJSON
+ 	// Get the http.Flusher interface to manually flush the response.
+ 	// This is crucial for streaming as it allows immediate sending of data chunks
+ 	flusher, ok := c.Writer.(http.Flusher)
+@@ -290,7 +345,15 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
+ 	// Create a cancellable context for the backend client request
+ 	// This allows proper cleanup and cancellation of ongoing requests
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
+-	cliCtx = withClaudeGenerationBudget(cliCtx)
++	if policy.codexRoute {
++		cliCtx = withClaudeGenerationBudget(cliCtx)
++	}
++	streamFilter, errConstraint := newClaudeSSEOutputFilter(policy.constraints)
++	if errConstraint != nil {
++		h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusInternalServerError, Error: errConstraint})
++		cliCancel(errConstraint)
++		return
++	}
+ 
+ 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+ 	setSSEHeaders := func() {
+@@ -343,14 +406,26 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
+ 			setSSEHeaders()
+ 			handlers.WriteUpstreamHeaders(c.Writer.Header(), upstreamHeaders)
+ 
+-			// Write the first chunk
+ 			if len(chunk) > 0 {
+-				_, _ = c.Writer.Write(chunk)
+-				flusher.Flush()
++				filtered, stopped, errConstraint := streamFilter.Process(chunk)
++				if errConstraint != nil {
++					h.writeClaudeStreamConstraintError(c, errConstraint)
++					flusher.Flush()
++					cliCancel(errConstraint)
++					return
++				}
++				if len(filtered) > 0 {
++					_, _ = c.Writer.Write(filtered)
++					flusher.Flush()
++				}
++				if stopped {
++					cliCancel(nil)
++					return
++				}
+ 			}
+ 
+ 			// Continue streaming the rest
+-			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan)
++			h.forwardClaudeStream(c, flusher, func(err error) { cliCancel(err) }, dataChan, errChan, streamFilter)
+ 			return
+ 		}
+ 	}
+@@ -371,18 +446,38 @@ func pendingClaudeStreamError(errs <-chan *interfaces.ErrorMessage) (*interfaces
+ 	}
+ }
+ 
+-func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage) {
++func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.Flusher, cancel func(error), data <-chan []byte, errs <-chan *interfaces.ErrorMessage, filter *claudeSSEOutputFilter) {
++	stopped := false
++	constraintFailed := false
+ 	h.ForwardStream(c, flusher, cancel, data, errs, handlers.StreamForwardOptions{
+ 		WriteChunk: func(chunk []byte) {
+-			if len(chunk) == 0 {
++			if len(chunk) == 0 || stopped || constraintFailed {
++				return
++			}
++			filtered, didStop, errConstraint := filter.Process(chunk)
++			if errConstraint != nil {
++				constraintFailed = true
++				h.writeClaudeStreamConstraintError(c, errConstraint)
++				cancel(errConstraint)
+ 				return
+ 			}
+-			_, _ = c.Writer.Write(chunk)
++			if len(filtered) > 0 {
++				_, _ = c.Writer.Write(filtered)
++			}
++			if didStop {
++				stopped = true
++				cancel(nil)
++			}
+ 		},
+ 		WriteTerminalError: func(errMsg *interfaces.ErrorMessage) {
+-			if errMsg == nil {
++			if errMsg == nil || stopped || constraintFailed {
+ 				return
+ 			}
++			if filter != nil {
++				if tail, errConstraint := filter.Finish(); errConstraint == nil {
++					_, _ = c.Writer.Write(tail)
++				}
++			}
+ 			status := http.StatusInternalServerError
+ 			if errMsg.StatusCode > 0 {
+ 				status = errMsg.StatusCode
+@@ -392,9 +487,30 @@ func (h *ClaudeCodeAPIHandler) forwardClaudeStream(c *gin.Context, flusher http.
+ 			errorBytes, _ := json.Marshal(h.toClaudeError(errMsg))
+ 			_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
+ 		},
++		WriteDone: func() {
++			if filter == nil || stopped || constraintFailed {
++				return
++			}
++			tail, errConstraint := filter.Finish()
++			if errConstraint != nil {
++				constraintFailed = true
++				h.writeClaudeStreamConstraintError(c, errConstraint)
++				return
++			}
++			_, _ = c.Writer.Write(tail)
++		},
+ 	})
+ }
+ 
++func (h *ClaudeCodeAPIHandler) writeClaudeRequestPolicyError(c *gin.Context, err error) {
++	h.WriteErrorResponse(c, &interfaces.ErrorMessage{StatusCode: http.StatusBadRequest, Error: err})
++}
++
++func (h *ClaudeCodeAPIHandler) writeClaudeStreamConstraintError(c *gin.Context, err error) {
++	errorBytes, _ := json.Marshal(h.toClaudeError(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err}))
++	_, _ = fmt.Fprintf(c.Writer, "event: error\ndata: %s\n\n", errorBytes)
++}
++
+ type claudeErrorDetail struct {
+ 	Type    string `json:"type"`
+ 	Message string `json:"message"`
+diff --git a/sdk/api/handlers/claude/code_handlers_model_test.go b/sdk/api/handlers/claude/code_handlers_model_test.go
+index 1dc77d1..210ec21 100644
+--- a/sdk/api/handlers/claude/code_handlers_model_test.go
++++ b/sdk/api/handlers/claude/code_handlers_model_test.go
+@@ -1,6 +1,7 @@
+ package claude
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"net/http/httptest"
+ 	"testing"
+@@ -64,6 +65,56 @@ func TestClaudeModelsResponseUsesConfiguredDisplayName(t *testing.T) {
+ 	t.Fatalf("model %q not found in response", modelID)
+ }
+ 
++func TestClaudeCatalogModelsPublishesOnlyExplicitClaudeIDs(t *testing.T) {
++	input := []map[string]any{
++		{"id": "claude-opus-4-8", "display_name": "Opus"},
++		{"id": "claude-fable-5-dd-los-6.5-tpg", "display_name": "Legacy encoded"},
++		{"id": "gpt-5.6-sol", "display_name": "GPT"},
++		{"id": "compat-text", "display_name": "Fixture"},
++	}
++	models := claudeCatalogModels(input)
++	if len(models) != 1 || models[0]["id"] != "claude-opus-4-8" {
++		t.Fatalf("Claude catalog = %v, want only explicit Claude alias", models)
++	}
++	if input[2]["id"] != "gpt-5.6-sol" {
++		t.Fatalf("catalog filtering mutated registry input: %v", input)
++	}
++}
++
++func TestClaudeRequestPolicyIsCodexRouteScoped(t *testing.T) {
++	registryRef := registry.GetGlobalRegistry()
++	tests := []struct {
++		name       string
++		provider   string
++		model      string
++		wantReject bool
++	}{
++		{name: "Codex alias enforces policy", provider: "codex", model: "claude-policy-codex-test", wantReject: true},
++		{name: "native Claude preserves fields", provider: "claude", model: "claude-policy-native-test", wantReject: false},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			clientID := tt.model + "-client"
++			registryRef.RegisterClient(clientID, tt.provider, []*registry.ModelInfo{{ID: tt.model}})
++			t.Cleanup(func() { registryRef.UnregisterClient(clientID) })
++			body := []byte(`{"model":"` + tt.model + `","max_tokens":64,"tools":[{"name":"lookup","defer_loading":true,"input_schema":{"type":"object"}}],"messages":[]}`)
++			policy, err := claudeRequestPolicyForRoute(body)
++			if tt.wantReject {
++				if err == nil {
++					t.Fatal("Codex route accepted unsupported defer_loading=true")
++				}
++				return
++			}
++			if err != nil {
++				t.Fatalf("native Claude policy: %v", err)
++			}
++			if policy.codexRoute || !bytes.Equal(policy.rawJSON, body) {
++				t.Fatalf("native Claude request was changed: codex=%v body=%s", policy.codexRoute, policy.rawJSON)
++			}
++		})
++	}
++}
++
+ func TestRewriteClaudeDDModelInBody(t *testing.T) {
+ 	tests := []struct {
+ 		name      string
+diff --git a/sdk/api/handlers/claude/context_management.go b/sdk/api/handlers/claude/context_management.go
+new file mode 100644
+index 0000000..dba6405
+--- /dev/null
++++ b/sdk/api/handlers/claude/context_management.go
+@@ -0,0 +1,148 @@
++package claude
++
++import "fmt"
++
++type claudeToolBlockLocation struct {
++	message int
++	content int
++}
++
++type claudeToolPair struct {
++	use    claudeToolBlockLocation
++	result claudeToolBlockLocation
++}
++
++func applyClaudeContextManagement(root map[string]any) error {
++	rawManagement, exists := root["context_management"]
++	if !exists {
++		return nil
++	}
++	management, ok := rawManagement.(map[string]any)
++	if !ok {
++		return newClaudeRequestPolicyError("$.context_management", "must be an object")
++	}
++	if len(management) != 1 {
++		return newClaudeRequestPolicyError("$.context_management", "only edits is supported")
++	}
++	rawEdits, ok := management["edits"]
++	if !ok {
++		return newClaudeRequestPolicyError("$.context_management.edits", "is required")
++	}
++	edits, ok := rawEdits.([]any)
++	if !ok || len(edits) != 1 {
++		return newClaudeRequestPolicyError("$.context_management.edits", "must contain one supported edit")
++	}
++	edit, ok := edits[0].(map[string]any)
++	if !ok || len(edit) != 1 {
++		return newClaudeRequestPolicyError("$.context_management.edits[0]", "must contain only type")
++	}
++	if edit["type"] != "clear_tool_uses_20250919" {
++		return newClaudeRequestPolicyError("$.context_management.edits[0].type", "unsupported context edit")
++	}
++
++	rawMessages, ok := root["messages"]
++	if !ok {
++		delete(root, "context_management")
++		return nil
++	}
++	messages, ok := rawMessages.([]any)
++	if !ok {
++		return newClaudeRequestPolicyError("$.messages", "must be an array")
++	}
++	uses := make(map[string]claudeToolBlockLocation)
++	results := make(map[string]claudeToolBlockLocation)
++	for i, rawMessage := range messages {
++		message, ok := rawMessage.(map[string]any)
++		if !ok {
++			return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d]", i), "must be an object")
++		}
++		contents, ok := message["content"].([]any)
++		if !ok {
++			continue
++		}
++		for j, rawContent := range contents {
++			content, ok := rawContent.(map[string]any)
++			if !ok {
++				continue
++			}
++			location := claudeToolBlockLocation{message: i, content: j}
++			switch content["type"] {
++			case "tool_use":
++				if message["role"] != "assistant" {
++					return newClaudeRequestPolicyError(toolLocationPath(location), "tool_use must be in an assistant message")
++				}
++				id, ok := content["id"].(string)
++				if !ok || id == "" {
++					return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d].content[%d].id", i, j), "tool_use requires a non-empty id")
++				}
++				if _, duplicate := uses[id]; duplicate {
++					return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d].content[%d].id", i, j), "duplicate tool_use id")
++				}
++				uses[id] = location
++			case "tool_result":
++				if message["role"] != "user" {
++					return newClaudeRequestPolicyError(toolLocationPath(location), "tool_result must be in a user message")
++				}
++				id, ok := content["tool_use_id"].(string)
++				if !ok || id == "" {
++					return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d].content[%d].tool_use_id", i, j), "tool_result requires a non-empty tool_use_id")
++				}
++				if _, duplicate := results[id]; duplicate {
++					return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d].content[%d].tool_use_id", i, j), "duplicate tool_result id")
++				}
++				results[id] = location
++			}
++		}
++	}
++
++	pairs := make([]claudeToolPair, 0, len(uses))
++	for id, use := range uses {
++		result, closed := results[id]
++		if !closed {
++			continue
++		}
++		if result.message <= use.message {
++			return newClaudeRequestPolicyError(toolLocationPath(result), "tool_result must follow its tool_use")
++		}
++		pairs = append(pairs, claudeToolPair{use: use, result: result})
++	}
++
++	remove := make(map[claudeToolBlockLocation]struct{})
++	lastMessage := len(messages) - 1
++	for _, pair := range pairs {
++		if pair.result.message == lastMessage {
++			continue
++		}
++		remove[pair.use] = struct{}{}
++		remove[pair.result] = struct{}{}
++	}
++	if len(remove) > 0 {
++		filteredMessages := make([]any, 0, len(messages))
++		for i, rawMessage := range messages {
++			message := rawMessage.(map[string]any)
++			contents, isArray := message["content"].([]any)
++			if !isArray {
++				filteredMessages = append(filteredMessages, message)
++				continue
++			}
++			filteredContents := make([]any, 0, len(contents))
++			for j, content := range contents {
++				if _, shouldRemove := remove[claudeToolBlockLocation{message: i, content: j}]; !shouldRemove {
++					filteredContents = append(filteredContents, content)
++				}
++			}
++			if len(filteredContents) == 0 {
++				continue
++			}
++			message["content"] = filteredContents
++			filteredMessages = append(filteredMessages, message)
++		}
++		root["messages"] = filteredMessages
++	}
++	delete(root, "context_management")
++	return nil
++}
++
++func toolLocationPath(location claudeToolBlockLocation) string {
++	return fmt.Sprintf("$.messages[%d].content[%d]", location.message, location.content)
++}
+diff --git a/sdk/api/handlers/claude/context_management_test.go b/sdk/api/handlers/claude/context_management_test.go
+new file mode 100644
+index 0000000..9d6901a
+--- /dev/null
++++ b/sdk/api/handlers/claude/context_management_test.go
+@@ -0,0 +1,95 @@
++package claude
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++func TestClaudeContextManagementClearsClosedHistoricalPairsAndKeepsActivePair(t *testing.T) {
++	policy, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},
++		"messages":[
++			{"role":"user","content":"first"},
++			{"role":"assistant","content":[{"type":"text","text":"old text"},{"type":"tool_use","id":"old","name":"lookup","input":{"q":"old"}}]},
++			{"role":"user","content":[{"type":"tool_result","tool_use_id":"old","content":"old result"},{"type":"text","text":"after old"}]},
++			{"role":"assistant","content":[{"type":"tool_use","id":"active","name":"lookup","input":{"q":"active"}}]},
++			{"role":"user","content":[{"type":"tool_result","tool_use_id":"active","content":"active result"}]}
++		]
++	}`))
++	if err != nil {
++		t.Fatalf("preflight: %v", err)
++	}
++	if gjson.GetBytes(policy.rawJSON, "context_management").Exists() {
++		t.Fatalf("context_management reached upstream: %s", policy.rawJSON)
++	}
++	text := string(policy.rawJSON)
++	if strings.Contains(text, `"id":"old"`) || strings.Contains(text, `"tool_use_id":"old"`) {
++		t.Fatalf("historical pair remained: %s", text)
++	}
++	if !strings.Contains(text, `"id":"active"`) || !strings.Contains(text, `"tool_use_id":"active"`) {
++		t.Fatalf("active pair was removed: %s", text)
++	}
++	if !strings.Contains(text, "old text") || !strings.Contains(text, "after old") {
++		t.Fatalf("neighboring historical text was removed: %s", text)
++	}
++}
++
++func TestClaudeContextManagementRejectsUnknownOrParameterizedEdit(t *testing.T) {
++	tests := []string{
++		`{"type":"unknown"}`,
++		`{"type":"clear_tool_uses_20250919","keep":1}`,
++	}
++	for _, edit := range tests {
++		body := []byte(`{"model":"test","max_tokens":64,"context_management":{"edits":[` + edit + `]},"messages":[]}`)
++		_, err := preflightClaudeRequest(body)
++		if err == nil || !strings.Contains(err.Error(), "$.context_management.edits[0]") {
++			t.Fatalf("edit %s error = %v", edit, err)
++		}
++	}
++}
++
++func TestClaudeContextManagementPreservesUnclosedToolBlocks(t *testing.T) {
++	tests := []struct {
++		name     string
++		messages string
++	}{
++		{
++			name:     "orphan use",
++			messages: `[{"role":"assistant","content":[{"type":"tool_use","id":"one","name":"lookup","input":{}}]}]`,
++		},
++		{
++			name:     "orphan result",
++			messages: `[{"role":"user","content":[{"type":"tool_result","tool_use_id":"one","content":"result"}]}]`,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			body := []byte(`{"model":"test","max_tokens":64,"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"messages":` + tt.messages + `}`)
++			policy, err := preflightClaudeRequest(body)
++			if err != nil {
++				t.Fatalf("preflight: %v", err)
++			}
++			if !strings.Contains(string(policy.rawJSON), "one") {
++				t.Fatalf("unclosed active block was removed: %s", policy.rawJSON)
++			}
++		})
++	}
++}
++
++func TestClaudeContextManagementRejectsToolBlocksInWrongRoles(t *testing.T) {
++	tests := []string{
++		`[{"role":"user","content":[{"type":"tool_use","id":"one","name":"lookup","input":{}}]},{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"one","content":"result"}]}]`,
++		`[{"role":"assistant","content":[{"type":"tool_use","id":"one","name":"lookup","input":{}}]},{"role":"assistant","content":[{"type":"tool_result","tool_use_id":"one","content":"result"}]}]`,
++	}
++	for _, messages := range tests {
++		body := []byte(`{"model":"test","max_tokens":64,"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},"messages":` + messages + `}`)
++		_, err := preflightClaudeRequest(body)
++		if err == nil || !strings.Contains(err.Error(), "$.messages[") {
++			t.Fatalf("wrong-role tool history error = %v", err)
++		}
++	}
++}
+diff --git a/sdk/api/handlers/claude/output_constraints.go b/sdk/api/handlers/claude/output_constraints.go
+new file mode 100644
+index 0000000..2ef76c9
+--- /dev/null
++++ b/sdk/api/handlers/claude/output_constraints.go
+@@ -0,0 +1,743 @@
++package claude
++
++import (
++	"bytes"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"unicode/utf8"
++
++	"github.com/tiktoken-go/tokenizer"
++)
++
++type claudeOutputConstraints struct {
++	maxTokens     int
++	stopSequences []string
++}
++
++func applyClaudeNonStreamingOutputConstraints(rawJSON []byte, constraints claudeOutputConstraints) ([]byte, string, error) {
++	stoppedJSON, matched, err := applyClaudeNonStreamingStopSequences(rawJSON, constraints.stopSequences)
++	if err != nil {
++		return nil, "", err
++	}
++	limitedJSON, capped, err := applyClaudeNonStreamingMaxTokens(stoppedJSON, constraints.maxTokens)
++	if err != nil {
++		return nil, "", err
++	}
++	if capped {
++		matched = ""
++	}
++	return limitedJSON, matched, nil
++}
++
++func applyClaudeNonStreamingStopSequences(rawJSON []byte, stopSequences []string) ([]byte, string, error) {
++	if len(stopSequences) == 0 {
++		return rawJSON, "", nil
++	}
++	var response map[string]any
++	if err := json.Unmarshal(rawJSON, &response); err != nil {
++		return nil, "", errors.New("Claude response was not valid JSON")
++	}
++	contents, ok := response["content"].([]any)
++	if !ok {
++		return nil, "", errors.New("Claude response content was not an array")
++	}
++
++	for start := 0; start < len(contents); {
++		_, isText := claudeTextBlock(contents[start])
++		if !isText {
++			start++
++			continue
++		}
++		end := start
++		var combined strings.Builder
++		for end < len(contents) {
++			textBlock, okText := claudeTextBlock(contents[end])
++			if !okText {
++				break
++			}
++			combined.WriteString(textBlock)
++			end++
++		}
++		matchAt, matched := earliestClaudeStop(combined.String(), stopSequences)
++		if matched == "" {
++			start = end
++			continue
++		}
++
++		prefix := combined.String()[:matchAt]
++		filtered := append([]any(nil), contents[:start]...)
++		remaining := prefix
++		for i := start; i < end && len(remaining) > 0; i++ {
++			original, _ := claudeTextBlock(contents[i])
++			take := len(original)
++			if take > len(remaining) {
++				take = len(remaining)
++			}
++			copyBlock := copyClaudeJSONMap(contents[i].(map[string]any))
++			copyBlock["text"] = remaining[:take]
++			filtered = append(filtered, copyBlock)
++			remaining = remaining[take:]
++		}
++		if len(prefix) == 0 && len(filtered) == 0 {
++			copyBlock := copyClaudeJSONMap(contents[start].(map[string]any))
++			copyBlock["text"] = ""
++			filtered = append(filtered, copyBlock)
++		}
++		response["content"] = filtered
++		response["stop_reason"] = "stop_sequence"
++		response["stop_sequence"] = matched
++		processed, err := json.Marshal(response)
++		if err != nil {
++			return nil, "", errors.New("Claude response could not be constrained")
++		}
++		return processed, matched, nil
++	}
++	return rawJSON, "", nil
++}
++
++func applyClaudeNonStreamingMaxTokens(rawJSON []byte, limit int) ([]byte, bool, error) {
++	if limit <= 0 {
++		return rawJSON, false, nil
++	}
++	codec, err := claudeOutputCodec()
++	if err != nil {
++		return nil, false, err
++	}
++	var response map[string]any
++	if err = json.Unmarshal(rawJSON, &response); err != nil {
++		return nil, false, errors.New("Claude response was not valid JSON")
++	}
++	contents, ok := response["content"].([]any)
++	if !ok {
++		return nil, false, errors.New("Claude response content was not an array")
++	}
++
++	remaining := limit
++	filtered := make([]any, 0, len(contents))
++	capped := false
++	for _, rawBlock := range contents {
++		block, okBlock := rawBlock.(map[string]any)
++		if !okBlock {
++			return nil, false, errors.New("Claude response contained an invalid content block")
++		}
++		field := claudeTruncatableContentField(block)
++		if field != "" {
++			text, _ := block[field].(string)
++			ids, _, errEncode := codec.Encode(text)
++			if errEncode != nil {
++				return nil, false, fmt.Errorf("Claude output tokenization failed: %w", errEncode)
++			}
++			if len(ids) <= remaining {
++				filtered = append(filtered, rawBlock)
++				remaining -= len(ids)
++				continue
++			}
++			if remaining > 0 {
++				prefix, errDecode := codec.Decode(ids[:remaining])
++				if errDecode != nil {
++					return nil, false, fmt.Errorf("Claude output token truncation failed: %w", errDecode)
++				}
++				copyBlock := copyClaudeJSONMap(block)
++				copyBlock[field] = prefix
++				if field == "thinking" {
++					delete(copyBlock, "signature")
++				}
++				filtered = append(filtered, copyBlock)
++			}
++			capped = true
++			break
++		}
++
++		encodedBlock, errMarshal := json.Marshal(block)
++		if errMarshal != nil {
++			return nil, false, errors.New("Claude response content could not be tokenized")
++		}
++		ids, _, errEncode := codec.Encode(string(encodedBlock))
++		if errEncode != nil {
++			return nil, false, fmt.Errorf("Claude output tokenization failed: %w", errEncode)
++		}
++		if len(ids) > remaining {
++			capped = true
++			break
++		}
++		filtered = append(filtered, rawBlock)
++		remaining -= len(ids)
++	}
++	if !capped {
++		return rawJSON, false, nil
++	}
++	if len(filtered) == 0 {
++		filtered = append(filtered, map[string]any{"type": "text", "text": ""})
++	}
++	response["content"] = filtered
++	response["stop_reason"] = "max_tokens"
++	response["stop_sequence"] = nil
++	processed, err := json.Marshal(response)
++	if err != nil {
++		return nil, false, errors.New("Claude response could not be constrained")
++	}
++	return processed, true, nil
++}
++
++func claudeTruncatableContentField(block map[string]any) string {
++	switch block["type"] {
++	case "text":
++		return "text"
++	case "thinking":
++		return "thinking"
++	default:
++		return ""
++	}
++}
++
++func claudeOutputCodec() (tokenizer.Codec, error) {
++	codec, err := tokenizer.ForModel(tokenizer.GPT5)
++	if err != nil {
++		return nil, fmt.Errorf("Claude output tokenizer initialization failed: %w", err)
++	}
++	return codec, nil
++}
++
++func claudeTextBlock(raw any) (string, bool) {
++	block, ok := raw.(map[string]any)
++	if !ok || block["type"] != "text" {
++		return "", false
++	}
++	text, ok := block["text"].(string)
++	return text, ok
++}
++
++func copyClaudeJSONMap(source map[string]any) map[string]any {
++	copyMap := make(map[string]any, len(source))
++	for key, value := range source {
++		copyMap[key] = value
++	}
++	return copyMap
++}
++
++func earliestClaudeStop(text string, sequences []string) (int, string) {
++	bestAt := -1
++	best := ""
++	for _, sequence := range sequences {
++		at := strings.Index(text, sequence)
++		if at >= 0 && (bestAt < 0 || at < bestAt) {
++			bestAt = at
++			best = sequence
++		}
++	}
++	return bestAt, best
++}
++
++type claudeSSEStopFilter struct {
++	sequences    []string
++	maxStopBytes int
++	codec        tokenizer.Codec
++	usedTokens   int
++	frameBuffer  []byte
++	pendingText  string
++	pendingIndex int
++	hasPending   bool
++	stopped      bool
++}
++
++func newClaudeSSEStopFilter(sequences []string) *claudeSSEStopFilter {
++	if len(sequences) == 0 {
++		return nil
++	}
++	codec, _ := claudeOutputCodec()
++	filter := &claudeSSEStopFilter{sequences: append([]string(nil), sequences...), codec: codec}
++	for _, sequence := range sequences {
++		if len(sequence) > filter.maxStopBytes {
++			filter.maxStopBytes = len(sequence)
++		}
++	}
++	return filter
++}
++
++func (f *claudeSSEStopFilter) Process(chunk []byte) ([]byte, bool, error) {
++	if f == nil {
++		return chunk, false, nil
++	}
++	if f.stopped {
++		return nil, true, nil
++	}
++	f.frameBuffer = append(f.frameBuffer, chunk...)
++	var output bytes.Buffer
++	for {
++		frameEnd := claudeSSEFrameEnd(f.frameBuffer)
++		if frameEnd == 0 {
++			break
++		}
++		frame := append([]byte(nil), f.frameBuffer[:frameEnd]...)
++		f.frameBuffer = f.frameBuffer[frameEnd:]
++		filtered, stopped, err := f.processFrame(frame)
++		if err != nil {
++			return nil, false, err
++		}
++		output.Write(filtered)
++		if stopped {
++			f.stopped = true
++			f.frameBuffer = nil
++			return output.Bytes(), true, nil
++		}
++	}
++	return output.Bytes(), false, nil
++}
++
++func (f *claudeSSEStopFilter) Finish() ([]byte, error) {
++	if f == nil || f.stopped {
++		return nil, nil
++	}
++	var output bytes.Buffer
++	if len(f.frameBuffer) > 0 {
++		frame := append(append([]byte(nil), f.frameBuffer...), '\n', '\n')
++		f.frameBuffer = nil
++		filtered, stopped, err := f.processFrame(frame)
++		if err != nil {
++			return nil, err
++		}
++		output.Write(filtered)
++		if stopped {
++			f.stopped = true
++			return output.Bytes(), nil
++		}
++	}
++	output.Write(f.flushPendingText())
++	return output.Bytes(), nil
++}
++
++func (f *claudeSSEStopFilter) processFrame(frame []byte) ([]byte, bool, error) {
++	data, hasData := claudeSSEData(frame)
++	if !hasData {
++		return frame, false, nil
++	}
++	var event struct {
++		Type  string `json:"type"`
++		Index int    `json:"index"`
++		Delta struct {
++			Type string `json:"type"`
++			Text string `json:"text"`
++		} `json:"delta"`
++	}
++	if err := json.Unmarshal(data, &event); err != nil {
++		return nil, false, errors.New("Claude SSE event data was not valid JSON")
++	}
++	if event.Type == "ping" {
++		return frame, false, nil
++	}
++	if event.Type != "content_block_delta" || event.Delta.Type != "text_delta" {
++		return append(f.flushPendingText(), frame...), false, nil
++	}
++
++	var output bytes.Buffer
++	if f.hasPending && f.pendingIndex != event.Index {
++		output.Write(f.flushPendingText())
++	}
++	f.pendingIndex = event.Index
++	f.hasPending = true
++	f.pendingText += event.Delta.Text
++	matchAt, matched := earliestClaudeStop(f.pendingText, f.sequences)
++	if matched != "" {
++		if matchAt > 0 {
++			output.Write(f.textDeltaEvent(f.pendingIndex, f.pendingText[:matchAt]))
++		}
++		f.pendingText = ""
++		f.hasPending = false
++		output.Write(claudeStopSequenceEvents(event.Index, matched, f.usedTokens))
++		return output.Bytes(), true, nil
++	}
++
++	holdBytes := f.maxStopBytes - 1
++	if holdBytes < 0 {
++		holdBytes = 0
++	}
++	if len(f.pendingText) > holdBytes {
++		cut := len(f.pendingText) - holdBytes
++		for cut > 0 && cut < len(f.pendingText) && !utf8.RuneStart(f.pendingText[cut]) {
++			cut--
++		}
++		if cut > 0 {
++			output.Write(f.textDeltaEvent(f.pendingIndex, f.pendingText[:cut]))
++			f.pendingText = f.pendingText[cut:]
++		}
++	}
++	return output.Bytes(), false, nil
++}
++
++func (f *claudeSSEStopFilter) flushPendingText() []byte {
++	if !f.hasPending || f.pendingText == "" {
++		f.pendingText = ""
++		f.hasPending = false
++		return nil
++	}
++	output := f.textDeltaEvent(f.pendingIndex, f.pendingText)
++	f.pendingText = ""
++	f.hasPending = false
++	return output
++}
++
++func (f *claudeSSEStopFilter) textDeltaEvent(index int, text string) []byte {
++	if f != nil && f.codec != nil && text != "" {
++		if count, err := f.codec.Count(text); err == nil {
++			f.usedTokens += count
++		}
++	}
++	return claudeTextDeltaEvent(index, text)
++}
++
++func claudeSSEFrameEnd(buffer []byte) int {
++	lf := bytes.Index(buffer, []byte("\n\n"))
++	crlf := bytes.Index(buffer, []byte("\r\n\r\n"))
++	switch {
++	case lf < 0 && crlf < 0:
++		return 0
++	case lf < 0:
++		return crlf + 4
++	case crlf < 0:
++		return lf + 2
++	case lf < crlf:
++		return lf + 2
++	default:
++		return crlf + 4
++	}
++}
++
++func claudeSSEData(frame []byte) ([]byte, bool) {
++	lines := bytes.Split(bytes.ReplaceAll(frame, []byte("\r\n"), []byte("\n")), []byte("\n"))
++	var dataLines [][]byte
++	for _, line := range lines {
++		if !bytes.HasPrefix(line, []byte("data:")) {
++			continue
++		}
++		value := bytes.TrimPrefix(line, []byte("data:"))
++		value = bytes.TrimPrefix(value, []byte(" "))
++		dataLines = append(dataLines, value)
++	}
++	if len(dataLines) == 0 {
++		return nil, false
++	}
++	return bytes.Join(dataLines, []byte("\n")), true
++}
++
++func claudeTextDeltaEvent(index int, text string) []byte {
++	payload, _ := json.Marshal(map[string]any{
++		"type":  "content_block_delta",
++		"index": index,
++		"delta": map[string]any{"type": "text_delta", "text": text},
++	})
++	return []byte(fmt.Sprintf("event: content_block_delta\ndata: %s\n\n", payload))
++}
++
++func claudeStopSequenceEvents(index int, matched string, outputTokens int) []byte {
++	blockStop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": index})
++	messageDelta, _ := json.Marshal(map[string]any{
++		"type": "message_delta",
++		"delta": map[string]any{
++			"stop_reason":   "stop_sequence",
++			"stop_sequence": matched,
++		},
++		"usage": map[string]any{"output_tokens": outputTokens},
++	})
++	messageStop, _ := json.Marshal(map[string]any{"type": "message_stop"})
++	return []byte(fmt.Sprintf(
++		"event: content_block_stop\ndata: %s\n\nevent: message_delta\ndata: %s\n\nevent: message_stop\ndata: %s\n\n",
++		blockStop,
++		messageDelta,
++		messageStop,
++	))
++}
++
++type claudeSSEOutputFilter struct {
++	stop    *claudeSSEStopFilter
++	maximum *claudeSSEMaxTokensFilter
++	stopped bool
++}
++
++func newClaudeSSEOutputFilter(constraints claudeOutputConstraints) (*claudeSSEOutputFilter, error) {
++	filter := &claudeSSEOutputFilter{stop: newClaudeSSEStopFilter(constraints.stopSequences)}
++	if constraints.maxTokens > 0 {
++		codec, err := claudeOutputCodec()
++		if err != nil {
++			return nil, err
++		}
++		filter.maximum = &claudeSSEMaxTokensFilter{codec: codec, limit: constraints.maxTokens}
++	}
++	return filter, nil
++}
++
++func (f *claudeSSEOutputFilter) Process(chunk []byte) ([]byte, bool, error) {
++	if f == nil {
++		return chunk, false, nil
++	}
++	if f.stopped {
++		return nil, true, nil
++	}
++	filtered := chunk
++	stopMatched := false
++	var err error
++	if f.stop != nil {
++		filtered, stopMatched, err = f.stop.Process(filtered)
++		if err != nil {
++			return nil, false, err
++		}
++	}
++	maxReached := false
++	if f.maximum != nil {
++		filtered, maxReached, err = f.maximum.Process(filtered)
++		if err != nil {
++			return nil, false, err
++		}
++	}
++	f.stopped = stopMatched || maxReached
++	return filtered, f.stopped, nil
++}
++
++func (f *claudeSSEOutputFilter) Finish() ([]byte, error) {
++	if f == nil || f.stopped {
++		return nil, nil
++	}
++	var output bytes.Buffer
++	if f.stop != nil {
++		tail, err := f.stop.Finish()
++		if err != nil {
++			return nil, err
++		}
++		if f.maximum != nil {
++			filtered, stopped, errProcess := f.maximum.Process(tail)
++			if errProcess != nil {
++				return nil, errProcess
++			}
++			output.Write(filtered)
++			if stopped {
++				f.stopped = true
++				return output.Bytes(), nil
++			}
++		} else {
++			output.Write(tail)
++		}
++	}
++	if f.maximum != nil {
++		tail, err := f.maximum.Finish()
++		if err != nil {
++			return nil, err
++		}
++		output.Write(tail)
++	}
++	return output.Bytes(), nil
++}
++
++type claudeSSEMaxTokensFilter struct {
++	codec tokenizer.Codec
++	limit int
++	used  int
++
++	frameBuffer []byte
++	toolBuffer  bytes.Buffer
++	toolIndex   int
++	toolName    string
++	toolArgs    strings.Builder
++	inTool      bool
++	stopped     bool
++}
++
++func (f *claudeSSEMaxTokensFilter) Process(chunk []byte) ([]byte, bool, error) {
++	if f == nil {
++		return chunk, false, nil
++	}
++	if f.stopped {
++		return nil, true, nil
++	}
++	f.frameBuffer = append(f.frameBuffer, chunk...)
++	var output bytes.Buffer
++	for {
++		frameEnd := claudeSSEFrameEnd(f.frameBuffer)
++		if frameEnd == 0 {
++			break
++		}
++		frame := append([]byte(nil), f.frameBuffer[:frameEnd]...)
++		f.frameBuffer = f.frameBuffer[frameEnd:]
++		filtered, stopped, err := f.processFrame(frame)
++		if err != nil {
++			return nil, false, err
++		}
++		output.Write(filtered)
++		if stopped {
++			f.stopped = true
++			f.frameBuffer = nil
++			return output.Bytes(), true, nil
++		}
++	}
++	return output.Bytes(), false, nil
++}
++
++func (f *claudeSSEMaxTokensFilter) Finish() ([]byte, error) {
++	if f == nil || f.stopped {
++		return nil, nil
++	}
++	var output bytes.Buffer
++	if len(f.frameBuffer) > 0 {
++		frame := append(append([]byte(nil), f.frameBuffer...), '\n', '\n')
++		f.frameBuffer = nil
++		filtered, stopped, err := f.processFrame(frame)
++		if err != nil {
++			return nil, err
++		}
++		output.Write(filtered)
++		if stopped {
++			f.stopped = true
++			return output.Bytes(), nil
++		}
++	}
++	if f.inTool {
++		return nil, errors.New("Claude stream ended before tool input completed")
++	}
++	return output.Bytes(), nil
++}
++
++func (f *claudeSSEMaxTokensFilter) processFrame(frame []byte) ([]byte, bool, error) {
++	data, hasData := claudeSSEData(frame)
++	if !hasData {
++		if f.inTool {
++			f.toolBuffer.Write(frame)
++			return nil, false, nil
++		}
++		return frame, false, nil
++	}
++	var event struct {
++		Type         string `json:"type"`
++		Index        int    `json:"index"`
++		ContentBlock struct {
++			Type string `json:"type"`
++			Name string `json:"name"`
++		} `json:"content_block"`
++		Delta struct {
++			Type        string `json:"type"`
++			Text        string `json:"text"`
++			Thinking    string `json:"thinking"`
++			PartialJSON string `json:"partial_json"`
++		} `json:"delta"`
++	}
++	if err := json.Unmarshal(data, &event); err != nil {
++		return nil, false, errors.New("Claude SSE event data was not valid JSON")
++	}
++
++	if f.inTool {
++		f.toolBuffer.Write(frame)
++		switch {
++		case event.Type == "content_block_delta" && event.Index == f.toolIndex && event.Delta.Type == "input_json_delta":
++			f.toolArgs.WriteString(event.Delta.PartialJSON)
++			return nil, false, nil
++		case event.Type == "content_block_stop" && event.Index == f.toolIndex:
++			ids, _, err := f.codec.Encode(f.toolName + f.toolArgs.String())
++			if err != nil {
++				return nil, false, fmt.Errorf("Claude tool output tokenization failed: %w", err)
++			}
++			buffered := append([]byte(nil), f.toolBuffer.Bytes()...)
++			f.resetTool()
++			if len(ids) > f.limit-f.used {
++				return claudeMaxTokensEvents(0, false, f.used), true, nil
++			}
++			f.used += len(ids)
++			return buffered, false, nil
++		case event.Type == "ping":
++			return nil, false, nil
++		default:
++			return nil, false, errors.New("Claude tool stream contained an unexpected event before content_block_stop")
++		}
++	}
++
++	if event.Type == "content_block_start" && isClaudeAtomicToolUseType(event.ContentBlock.Type) {
++		if f.used >= f.limit {
++			return claudeMaxTokensEvents(0, false, f.used), true, nil
++		}
++		f.inTool = true
++		f.toolIndex = event.Index
++		f.toolName = event.ContentBlock.Name
++		f.toolBuffer.Write(frame)
++		return nil, false, nil
++	}
++
++	field := ""
++	value := ""
++	if event.Type == "content_block_delta" {
++		switch event.Delta.Type {
++		case "text_delta":
++			field = "text"
++			value = event.Delta.Text
++		case "thinking_delta":
++			field = "thinking"
++			value = event.Delta.Thinking
++		case "input_json_delta":
++			return nil, false, errors.New("Claude tool arguments arrived without a tool content block")
++		}
++	}
++	if field != "" {
++		ids, _, err := f.codec.Encode(value)
++		if err != nil {
++			return nil, false, fmt.Errorf("Claude output tokenization failed: %w", err)
++		}
++		remaining := f.limit - f.used
++		if len(ids) <= remaining {
++			f.used += len(ids)
++			return frame, false, nil
++		}
++		var output bytes.Buffer
++		if remaining > 0 {
++			prefix, errDecode := f.codec.Decode(ids[:remaining])
++			if errDecode != nil {
++				return nil, false, fmt.Errorf("Claude output token truncation failed: %w", errDecode)
++			}
++			output.Write(claudeStringDeltaEvent(event.Index, event.Delta.Type, field, prefix))
++			f.used += remaining
++		}
++		output.Write(claudeMaxTokensEvents(event.Index, true, f.used))
++		return output.Bytes(), true, nil
++	}
++
++	if event.Type == "content_block_start" && f.used >= f.limit {
++		return claudeMaxTokensEvents(0, false, f.used), true, nil
++	}
++	return frame, false, nil
++}
++
++func isClaudeAtomicToolUseType(blockType string) bool {
++	return blockType == "tool_use" || strings.HasSuffix(blockType, "_tool_use")
++}
++
++func (f *claudeSSEMaxTokensFilter) resetTool() {
++	f.toolBuffer.Reset()
++	f.toolArgs.Reset()
++	f.toolIndex = 0
++	f.toolName = ""
++	f.inTool = false
++}
++
++func claudeStringDeltaEvent(index int, deltaType, field, value string) []byte {
++	payload, _ := json.Marshal(map[string]any{
++		"type":  "content_block_delta",
++		"index": index,
++		"delta": map[string]any{"type": deltaType, field: value},
++	})
++	return []byte(fmt.Sprintf("event: content_block_delta\ndata: %s\n\n", payload))
++}
++
++func claudeMaxTokensEvents(index int, closeBlock bool, used int) []byte {
++	messageDelta, _ := json.Marshal(map[string]any{
++		"type": "message_delta",
++		"delta": map[string]any{
++			"stop_reason":   "max_tokens",
++			"stop_sequence": nil,
++		},
++		"usage": map[string]any{"output_tokens": used},
++	})
++	messageStop, _ := json.Marshal(map[string]any{"type": "message_stop"})
++	var output bytes.Buffer
++	if closeBlock {
++		blockStop, _ := json.Marshal(map[string]any{"type": "content_block_stop", "index": index})
++		_, _ = fmt.Fprintf(&output, "event: content_block_stop\ndata: %s\n\n", blockStop)
++	}
++	_, _ = fmt.Fprintf(&output, "event: message_delta\ndata: %s\n\nevent: message_stop\ndata: %s\n\n", messageDelta, messageStop)
++	return output.Bytes()
++}
+diff --git a/sdk/api/handlers/claude/output_constraints_test.go b/sdk/api/handlers/claude/output_constraints_test.go
+new file mode 100644
+index 0000000..ee6a011
+--- /dev/null
++++ b/sdk/api/handlers/claude/output_constraints_test.go
+@@ -0,0 +1,290 @@
++package claude
++
++import (
++	"bytes"
++	"encoding/json"
++	"strings"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++func TestClaudeNonStreamingStopSequenceSpansTextBlocks(t *testing.T) {
++	input := []byte(`{
++		"type":"message",
++		"content":[
++			{"type":"text","text":"alpha EN"},
++			{"type":"text","text":"D hidden"},
++			{"type":"tool_use","id":"later","name":"mutate","input":{"value":"must not run"}}
++		],
++		"stop_reason":"tool_use",
++		"stop_sequence":null
++	}`)
++	output, matched, err := applyClaudeNonStreamingOutputConstraints(input, claudeOutputConstraints{stopSequences: []string{"END"}})
++	if err != nil {
++		t.Fatalf("apply constraints: %v", err)
++	}
++	if matched != "END" {
++		t.Fatalf("matched = %q, want END", matched)
++	}
++	if got := gjson.GetBytes(output, "content.0.text").String(); got != "alpha " {
++		t.Fatalf("text = %q; output=%s", got, output)
++	}
++	if len(gjson.GetBytes(output, "content").Array()) != 1 {
++		t.Fatalf("content after stop contains later blocks: %s", output)
++	}
++	if gjson.GetBytes(output, "stop_reason").String() != "stop_sequence" || gjson.GetBytes(output, "stop_sequence").String() != "END" {
++		t.Fatalf("stop metadata missing: %s", output)
++	}
++}
++
++func TestClaudeNonStreamingStopSequenceDoesNotInspectToolJSON(t *testing.T) {
++	input := []byte(`{
++		"type":"message",
++		"content":[
++			{"type":"tool_use","id":"one","name":"lookup","input":{"value":"END"}},
++			{"type":"text","text":"visible"}
++		],
++		"stop_reason":"tool_use"
++	}`)
++	output, matched, err := applyClaudeNonStreamingOutputConstraints(input, claudeOutputConstraints{stopSequences: []string{"END"}})
++	if err != nil {
++		t.Fatalf("apply constraints: %v", err)
++	}
++	if matched != "" || !bytes.Equal(output, input) {
++		t.Fatalf("tool JSON triggered or was changed: matched=%q output=%s", matched, output)
++	}
++}
++
++func TestClaudeNonStreamingMaxTokensTruncatesVisibleText(t *testing.T) {
++	input := []byte(`{
++		"type":"message",
++		"content":[{"type":"text","text":"one two three four five"}],
++		"stop_reason":"end_turn",
++		"stop_sequence":null
++	}`)
++	output, matched, err := applyClaudeNonStreamingOutputConstraints(input, claudeOutputConstraints{maxTokens: 2})
++	if err != nil {
++		t.Fatalf("apply constraints: %v", err)
++	}
++	if matched != "" {
++		t.Fatalf("matched stop sequence = %q, want empty", matched)
++	}
++	if got := gjson.GetBytes(output, "stop_reason").String(); got != "max_tokens" {
++		t.Fatalf("stop_reason = %q, want max_tokens; output=%s", got, output)
++	}
++	text := gjson.GetBytes(output, "content.0.text").String()
++	codec, err := claudeOutputCodec()
++	if err != nil {
++		t.Fatalf("codec: %v", err)
++	}
++	count, err := codec.Count(text)
++	if err != nil || count > 2 {
++		t.Fatalf("visible output token count = %d, err=%v, text=%q", count, err, text)
++	}
++	if text == "one two three four five" {
++		t.Fatalf("text was not truncated: %q", text)
++	}
++}
++
++func TestClaudeNonStreamingMaxTokensKeepsToolInputAtomic(t *testing.T) {
++	input := []byte(`{
++		"type":"message",
++		"content":[
++			{"type":"text","text":"ok"},
++			{"type":"tool_use","id":"tool_1","name":"mutate","input":{"value":"long value that cannot fit"}}
++		],
++		"stop_reason":"tool_use"
++	}`)
++	output, _, err := applyClaudeNonStreamingOutputConstraints(input, claudeOutputConstraints{maxTokens: 2})
++	if err != nil {
++		t.Fatalf("apply constraints: %v", err)
++	}
++	if strings.Contains(string(output), `"type":"tool_use"`) || strings.Contains(string(output), "long value") {
++		t.Fatalf("partial tool block escaped max-token boundary: %s", output)
++	}
++	if got := gjson.GetBytes(output, "stop_reason").String(); got != "max_tokens" {
++		t.Fatalf("stop_reason = %q, want max_tokens; output=%s", got, output)
++	}
++}
++
++func TestClaudeStreamingStopSequenceSpansChunksWithoutLeakingText(t *testing.T) {
++	filter := newClaudeSSEStopFilter([]string{"STOP"})
++	first := claudeTextDeltaEvent(0, "hello ST")
++	second := claudeTextDeltaEvent(0, "OP hidden")
++
++	var output bytes.Buffer
++	part, stopped, err := filter.Process(first)
++	if err != nil || stopped {
++		t.Fatalf("first chunk = stopped %v, err %v", stopped, err)
++	}
++	output.Write(part)
++	part, stopped, err = filter.Process(second[:len(second)/2])
++	if err != nil || stopped || len(part) != 0 {
++		t.Fatalf("partial frame = %q, stopped %v, err %v", part, stopped, err)
++	}
++	part, stopped, err = filter.Process(second[len(second)/2:])
++	if err != nil || !stopped {
++		t.Fatalf("second chunk = stopped %v, err %v", stopped, err)
++	}
++	output.Write(part)
++
++	if got := streamedClaudeText(output.Bytes()); got != "hello " {
++		t.Fatalf("streamed text = %q; output=%s", got, output.Bytes())
++	}
++	if strings.Contains(streamedClaudeText(output.Bytes()), "STOP") || strings.Contains(streamedClaudeText(output.Bytes()), "hidden") {
++		t.Fatalf("stop text leaked: %s", output.Bytes())
++	}
++	if !strings.Contains(output.String(), `"stop_reason":"stop_sequence"`) || !strings.Contains(output.String(), `"stop_sequence":"STOP"`) || !strings.Contains(output.String(), `"type":"message_stop"`) {
++		t.Fatalf("legal stop sequence terminal events missing: %s", output.Bytes())
++	}
++	if strings.Contains(output.String(), `"output_tokens":0`) {
++		t.Fatalf("local stop sequence reported zero usage after visible output: %s", output.Bytes())
++	}
++}
++
++func TestClaudeStreamingStopSequenceNeverCutsToolJSON(t *testing.T) {
++	filter := newClaudeSSEStopFilter([]string{"STOP"})
++	toolPayload, _ := json.Marshal(map[string]any{
++		"type":  "content_block_delta",
++		"index": 1,
++		"delta": map[string]any{
++			"type":         "input_json_delta",
++			"partial_json": `{"value":"STOP"}`,
++		},
++	})
++	frame := []byte("event: content_block_delta\ndata: " + string(toolPayload) + "\n\n")
++	first, stopped, err := filter.Process(frame[:len(frame)/2])
++	if err != nil || stopped || len(first) != 0 {
++		t.Fatalf("first half = %q, stopped %v, err %v", first, stopped, err)
++	}
++	second, stopped, err := filter.Process(frame[len(frame)/2:])
++	if err != nil || stopped {
++		t.Fatalf("second half = stopped %v, err %v", stopped, err)
++	}
++	if !bytes.Equal(second, frame) {
++		t.Fatalf("tool JSON changed:\n got %q\nwant %q", second, frame)
++	}
++}
++
++func TestClaudeStreamingStopSequenceSpansPingEvent(t *testing.T) {
++	filter := newClaudeSSEStopFilter([]string{"STOP"})
++	chunks := [][]byte{
++		claudeTextDeltaEvent(0, "hello ST"),
++		[]byte("event: ping\ndata: {\"type\":\"ping\"}\n\n"),
++		claudeTextDeltaEvent(0, "OP hidden"),
++	}
++
++	var output bytes.Buffer
++	for i, chunk := range chunks {
++		part, stopped, err := filter.Process(chunk)
++		if err != nil {
++			t.Fatalf("chunk %d: %v", i, err)
++		}
++		output.Write(part)
++		if stopped != (i == len(chunks)-1) {
++			t.Fatalf("chunk %d stopped = %v", i, stopped)
++		}
++	}
++	if got := streamedClaudeText(output.Bytes()); got != "hello " {
++		t.Fatalf("streamed text = %q; output=%s", got, output.Bytes())
++	}
++}
++
++func TestClaudeStreamingStopFilterFlushesHeldTailAtEnd(t *testing.T) {
++	filter := newClaudeSSEStopFilter([]string{"STOP"})
++	part, stopped, err := filter.Process(claudeTextDeltaEvent(0, "ordinary text"))
++	if err != nil || stopped {
++		t.Fatalf("process = stopped %v, err %v", stopped, err)
++	}
++	tail, err := filter.Finish()
++	if err != nil {
++		t.Fatalf("finish: %v", err)
++	}
++	if got := streamedClaudeText(append(part, tail...)); got != "ordinary text" {
++		t.Fatalf("streamed text = %q", got)
++	}
++}
++
++func TestClaudeStreamingMaxTokensClosesStreamLegally(t *testing.T) {
++	filter, err := newClaudeSSEOutputFilter(claudeOutputConstraints{maxTokens: 2})
++	if err != nil {
++		t.Fatalf("new filter: %v", err)
++	}
++	start := []byte("event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n")
++	first, stopped, err := filter.Process(start)
++	if err != nil || stopped {
++		t.Fatalf("start = stopped %v, err %v", stopped, err)
++	}
++	second, stopped, err := filter.Process(claudeTextDeltaEvent(0, "one two three four five"))
++	if err != nil || !stopped {
++		t.Fatalf("text = stopped %v, err %v", stopped, err)
++	}
++	output := append(first, second...)
++	text := streamedClaudeText(output)
++	codec, err := claudeOutputCodec()
++	if err != nil {
++		t.Fatalf("codec: %v", err)
++	}
++	count, err := codec.Count(text)
++	if err != nil || count > 2 {
++		t.Fatalf("visible output token count = %d, err=%v, text=%q", count, err, text)
++	}
++	if !strings.Contains(string(output), `"stop_reason":"max_tokens"`) || !strings.Contains(string(output), `"type":"message_stop"`) {
++		t.Fatalf("legal max_tokens terminal events missing: %s", output)
++	}
++}
++
++func TestClaudeStreamingMaxTokensKeepsToolInputAtomic(t *testing.T) {
++	filter, err := newClaudeSSEOutputFilter(claudeOutputConstraints{maxTokens: 1})
++	if err != nil {
++		t.Fatalf("new filter: %v", err)
++	}
++	stream := []byte(
++		"event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"mutate\",\"input\":{}}}\n\n" +
++			"event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"value\\\":\\\"must not be partial\\\"}\"}}\n\n" +
++			"event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
++	)
++	output, stopped, err := filter.Process(stream)
++	if err != nil || !stopped {
++		t.Fatalf("tool stream = stopped %v, err %v", stopped, err)
++	}
++	if strings.Contains(string(output), `"type":"tool_use"`) || strings.Contains(string(output), "partial_json") {
++		t.Fatalf("partial tool stream escaped: %s", output)
++	}
++	if !strings.Contains(string(output), `"stop_reason":"max_tokens"`) {
++		t.Fatalf("max_tokens terminal missing: %s", output)
++	}
++}
++
++func TestClaudeNonStreamingConstraintsFailClosedOnInvalidContentShape(t *testing.T) {
++	for _, constraints := range []claudeOutputConstraints{
++		{stopSequences: []string{"STOP"}},
++		{maxTokens: 1},
++	} {
++		if _, _, err := applyClaudeNonStreamingOutputConstraints([]byte(`{"type":"message","content":"invalid"}`), constraints); err == nil {
++			t.Fatalf("constraints %+v accepted a non-array content response", constraints)
++		}
++	}
++}
++
++func streamedClaudeText(stream []byte) string {
++	var result strings.Builder
++	for _, frame := range bytes.Split(stream, []byte("\n\n")) {
++		data, ok := claudeSSEData(frame)
++		if !ok {
++			continue
++		}
++		var event struct {
++			Type  string `json:"type"`
++			Delta struct {
++				Type string `json:"type"`
++				Text string `json:"text"`
++			} `json:"delta"`
++		}
++		if json.Unmarshal(data, &event) == nil && event.Type == "content_block_delta" && event.Delta.Type == "text_delta" {
++			result.WriteString(event.Delta.Text)
++		}
++	}
++	return result.String()
++}
+diff --git a/sdk/api/handlers/claude/request_policy.go b/sdk/api/handlers/claude/request_policy.go
+new file mode 100644
+index 0000000..bdc9ce2
+--- /dev/null
++++ b/sdk/api/handlers/claude/request_policy.go
+@@ -0,0 +1,430 @@
++package claude
++
++import (
++	"encoding/base64"
++	"encoding/json"
++	"fmt"
++	"io"
++	"net/url"
++	"strings"
++)
++
++const (
++	maxClaudeDocumentBytes      = 10 << 20
++	maxClaudeDocumentsTotalSize = 20 << 20
++	maxClaudeStopSequences      = 4
++	maxClaudeStopSequenceBytes  = 1024
++)
++
++var allowedClaudeDocumentMIMETypes = map[string]struct{}{
++	"application/json": {},
++	"application/pdf":  {},
++	"text/html":        {},
++	"text/markdown":    {},
++	"text/plain":       {},
++}
++
++type claudeRequestPolicy struct {
++	rawJSON     []byte
++	constraints claudeOutputConstraints
++	codexRoute  bool
++}
++
++type claudeRequestPolicyError struct {
++	path    string
++	message string
++}
++
++func (e *claudeRequestPolicyError) Error() string {
++	return fmt.Sprintf("%s: %s", e.path, e.message)
++}
++
++func newClaudeRequestPolicyError(path, message string) error {
++	return &claudeRequestPolicyError{path: path, message: message}
++}
++
++func preflightClaudeRequest(rawJSON []byte) (*claudeRequestPolicy, error) {
++	root, err := decodeClaudeRequestObject(rawJSON)
++	if err != nil {
++		return nil, err
++	}
++
++	maxTokens, err := validateClaudeMaxTokens(root)
++	if err != nil {
++		return nil, err
++	}
++	stopSequences, err := takeClaudeStopSequences(root)
++	if err != nil {
++		return nil, err
++	}
++	if err = validateClaudeTools(root); err != nil {
++		return nil, err
++	}
++	if err = validateClaudeDocuments(root); err != nil {
++		return nil, err
++	}
++	if err = applyClaudeContextManagement(root); err != nil {
++		return nil, err
++	}
++
++	processed, err := json.Marshal(root)
++	if err != nil {
++		return nil, newClaudeRequestPolicyError("$", "request could not be normalized")
++	}
++	return &claudeRequestPolicy{
++		rawJSON: processed,
++		constraints: claudeOutputConstraints{
++			maxTokens:     maxTokens,
++			stopSequences: stopSequences,
++		},
++		codexRoute: true,
++	}, nil
++}
++
++func decodeClaudeRequestObject(rawJSON []byte) (map[string]any, error) {
++	decoder := json.NewDecoder(strings.NewReader(string(rawJSON)))
++	decoder.UseNumber()
++	var root map[string]any
++	if err := decoder.Decode(&root); err != nil || root == nil {
++		return nil, newClaudeRequestPolicyError("$", "request body must be a JSON object")
++	}
++	var trailing any
++	if err := decoder.Decode(&trailing); err != io.EOF {
++		return nil, newClaudeRequestPolicyError("$", "request body must contain one JSON object")
++	}
++	return root, nil
++}
++
++func validateClaudeMaxTokens(root map[string]any) (int, error) {
++	raw, exists := root["max_tokens"]
++	if !exists {
++		return 0, nil
++	}
++	number, ok := raw.(json.Number)
++	if !ok {
++		return 0, newClaudeRequestPolicyError("$.max_tokens", "must be a positive integer")
++	}
++	value, err := number.Int64()
++	if err != nil || value <= 0 || uint64(value) > uint64(^uint(0)>>1) {
++		return 0, newClaudeRequestPolicyError("$.max_tokens", "must be a positive integer")
++	}
++	return int(value), nil
++}
++
++func takeClaudeStopSequences(root map[string]any) ([]string, error) {
++	raw, exists := root["stop_sequences"]
++	if !exists {
++		return nil, nil
++	}
++	values, ok := raw.([]any)
++	if !ok || len(values) == 0 || len(values) > maxClaudeStopSequences {
++		return nil, newClaudeRequestPolicyError("$.stop_sequences", "must contain between 1 and 4 strings")
++	}
++	sequences := make([]string, 0, len(values))
++	for i, rawValue := range values {
++		value, ok := rawValue.(string)
++		if !ok || value == "" || len(value) > maxClaudeStopSequenceBytes {
++			return nil, newClaudeRequestPolicyError(fmt.Sprintf("$.stop_sequences[%d]", i), "must be a non-empty string no longer than 1024 bytes")
++		}
++		sequences = append(sequences, value)
++	}
++	delete(root, "stop_sequences")
++	return sequences, nil
++}
++
++func validateClaudeTools(root map[string]any) error {
++	rawTools, exists := root["tools"]
++	if !exists {
++		return nil
++	}
++	tools, ok := rawTools.([]any)
++	if !ok {
++		return newClaudeRequestPolicyError("$.tools", "must be an array")
++	}
++	for i, rawTool := range tools {
++		tool, ok := rawTool.(map[string]any)
++		if !ok {
++			return newClaudeRequestPolicyError(fmt.Sprintf("$.tools[%d]", i), "must be an object")
++		}
++		path := fmt.Sprintf("$.tools[%d]", i)
++		if rawDefer, exists := tool["defer_loading"]; exists {
++			deferLoading, ok := rawDefer.(bool)
++			if !ok {
++				return newClaudeRequestPolicyError(path+".defer_loading", "must be a boolean")
++			}
++			if deferLoading {
++				return newClaudeRequestPolicyError(path+".defer_loading", "true is not supported")
++			}
++			delete(tool, "defer_loading")
++		}
++		strict := false
++		if rawStrict, exists := tool["strict"]; exists {
++			var okStrict bool
++			strict, okStrict = rawStrict.(bool)
++			if !okStrict {
++				return newClaudeRequestPolicyError(path+".strict", "must be a boolean")
++			}
++		}
++		if strict {
++			if err := validateClaudeStrictSchema(tool["input_schema"], path+".input_schema"); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func validateClaudeStrictSchema(raw any, path string) error {
++	schema, ok := raw.(map[string]any)
++	if !ok {
++		return newClaudeRequestPolicyError(path, "strict tools require an object schema")
++	}
++	if err := rejectClaudeStrictReferenceKeywords(schema, path); err != nil {
++		return err
++	}
++	if schemaType, ok := schema["type"].(string); !ok || schemaType != "object" {
++		return newClaudeRequestPolicyError(path+".type", "strict tools require type object")
++	}
++	properties, ok := schema["properties"].(map[string]any)
++	if !ok {
++		return newClaudeRequestPolicyError(path+".properties", "strict tools require an object properties map")
++	}
++	additional, exists := schema["additionalProperties"]
++	if !exists {
++		return newClaudeRequestPolicyError(path+".additionalProperties", "strict tools require false")
++	}
++	if value, ok := additional.(bool); !ok || value {
++		return newClaudeRequestPolicyError(path+".additionalProperties", "strict tools require false")
++	}
++	return validateClaudeStrictSchemaNode(schema, properties, path)
++}
++
++func validateClaudeStrictSchemaNode(schema map[string]any, properties map[string]any, path string) error {
++	if additional, exists := schema["additionalProperties"]; exists {
++		if value, ok := additional.(bool); !ok || value {
++			return newClaudeRequestPolicyError(path+".additionalProperties", "strict object schemas require false")
++		}
++	}
++	if properties != nil {
++		rawRequired, exists := schema["required"]
++		if !exists && len(properties) > 0 {
++			return newClaudeRequestPolicyError(path+".required", "strict object schemas must require every property")
++		}
++		required, ok := rawRequired.([]any)
++		if exists && !ok {
++			return newClaudeRequestPolicyError(path+".required", "must be an array of property names")
++		}
++		requiredSet := make(map[string]struct{}, len(required))
++		for i, rawName := range required {
++			name, ok := rawName.(string)
++			if !ok {
++				return newClaudeRequestPolicyError(fmt.Sprintf("%s.required[%d]", path, i), "must be a property name")
++			}
++			if _, exists := properties[name]; !exists {
++				return newClaudeRequestPolicyError(fmt.Sprintf("%s.required[%d]", path, i), "references an unknown property")
++			}
++			requiredSet[name] = struct{}{}
++		}
++		for name, rawProperty := range properties {
++			if _, required := requiredSet[name]; !required {
++				return newClaudeRequestPolicyError(path+".required", "strict object schemas must require every property")
++			}
++			property, ok := rawProperty.(map[string]any)
++			if !ok {
++				return newClaudeRequestPolicyError(path+".properties."+name, "must be a schema object")
++			}
++			if err := validateClaudeStrictNestedSchema(property, path+".properties."+name); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func validateClaudeStrictNestedSchema(schema map[string]any, path string) error {
++	if err := rejectClaudeStrictReferenceKeywords(schema, path); err != nil {
++		return err
++	}
++	var properties map[string]any
++	if rawProperties, exists := schema["properties"]; exists {
++		var ok bool
++		properties, ok = rawProperties.(map[string]any)
++		if !ok {
++			return newClaudeRequestPolicyError(path+".properties", "must be an object")
++		}
++	}
++	if schemaType, _ := schema["type"].(string); schemaType == "object" && properties == nil {
++		return newClaudeRequestPolicyError(path+".properties", "strict object schemas require a properties map")
++	}
++	if properties != nil {
++		additional, exists := schema["additionalProperties"]
++		if !exists {
++			return newClaudeRequestPolicyError(path+".additionalProperties", "strict object schemas require false")
++		}
++		if value, ok := additional.(bool); !ok || value {
++			return newClaudeRequestPolicyError(path+".additionalProperties", "strict object schemas require false")
++		}
++		if err := validateClaudeStrictSchemaNode(schema, properties, path); err != nil {
++			return err
++		}
++	}
++	if rawItems, exists := schema["items"]; exists {
++		items, ok := rawItems.(map[string]any)
++		if !ok {
++			return newClaudeRequestPolicyError(path+".items", "must be a schema object")
++		}
++		if err := validateClaudeStrictNestedSchema(items, path+".items"); err != nil {
++			return err
++		}
++	}
++	for _, keyword := range []string{"allOf", "anyOf", "oneOf"} {
++		rawOptions, exists := schema[keyword]
++		if !exists {
++			continue
++		}
++		options, ok := rawOptions.([]any)
++		if !ok || len(options) == 0 {
++			return newClaudeRequestPolicyError(path+"."+keyword, "must be a non-empty array of schema objects")
++		}
++		for i, rawOption := range options {
++			option, ok := rawOption.(map[string]any)
++			if !ok {
++				return newClaudeRequestPolicyError(fmt.Sprintf("%s.%s[%d]", path, keyword, i), "must be a schema object")
++			}
++			if err := validateClaudeStrictNestedSchema(option, fmt.Sprintf("%s.%s[%d]", path, keyword, i)); err != nil {
++				return err
++			}
++		}
++	}
++	return nil
++}
++
++func rejectClaudeStrictReferenceKeywords(schema map[string]any, path string) error {
++	for _, keyword := range []string{"$ref", "$defs", "definitions"} {
++		if _, exists := schema[keyword]; exists {
++			return newClaudeRequestPolicyError(path+"."+keyword, "is not supported for strict tools")
++		}
++	}
++	return nil
++}
++
++func validateClaudeDocuments(root map[string]any) error {
++	rawMessages, exists := root["messages"]
++	if !exists {
++		return nil
++	}
++	messages, ok := rawMessages.([]any)
++	if !ok {
++		return newClaudeRequestPolicyError("$.messages", "must be an array")
++	}
++	totalBytes := 0
++	for i, rawMessage := range messages {
++		message, ok := rawMessage.(map[string]any)
++		if !ok {
++			return newClaudeRequestPolicyError(fmt.Sprintf("$.messages[%d]", i), "must be an object")
++		}
++		contents, ok := message["content"].([]any)
++		if !ok {
++			continue
++		}
++		for j, rawContent := range contents {
++			content, ok := rawContent.(map[string]any)
++			if !ok || content["type"] != "document" {
++				continue
++			}
++			path := fmt.Sprintf("$.messages[%d].content[%d]", i, j)
++			if err := rejectUnknownClaudeDocumentFields(content, path); err != nil {
++				return err
++			}
++			if message["role"] != "user" {
++				return newClaudeRequestPolicyError(path, "document blocks are supported only in user messages")
++			}
++			source, ok := content["source"].(map[string]any)
++			if !ok {
++				return newClaudeRequestPolicyError(path+".source", "must be an object")
++			}
++			mediaType, ok := source["media_type"].(string)
++			mediaType = strings.ToLower(strings.TrimSpace(mediaType))
++			if !ok {
++				mediaType = ""
++			}
++			sourceType, _ := source["type"].(string)
++			switch sourceType {
++			case "base64":
++				if _, allowed := allowedClaudeDocumentMIMETypes[mediaType]; !allowed {
++					return newClaudeRequestPolicyError(path+".source.media_type", "is not an allowed document MIME type")
++				}
++				data, ok := source["data"].(string)
++				if !ok || data == "" {
++					return newClaudeRequestPolicyError(path+".source.data", "must be non-empty base64")
++				}
++				if base64.StdEncoding.DecodedLen(len(data)) > maxClaudeDocumentBytes+2 {
++					return newClaudeRequestPolicyError(path+".source.data", "exceeds the per-document size limit")
++				}
++				decoded, err := base64.StdEncoding.Strict().DecodeString(data)
++				if err != nil {
++					return newClaudeRequestPolicyError(path+".source.data", "must be valid base64")
++				}
++				if len(decoded) > maxClaudeDocumentBytes {
++					return newClaudeRequestPolicyError(path+".source.data", "exceeds the per-document size limit")
++				}
++				totalBytes += len(decoded)
++				if totalBytes > maxClaudeDocumentsTotalSize {
++					return newClaudeRequestPolicyError("$.messages", "embedded documents exceed the total size limit")
++				}
++				if err := rejectUnknownClaudeDocumentSourceFields(source, path+".source", "type", "media_type", "data"); err != nil {
++					return err
++				}
++			case "url":
++				if mediaType != "" {
++					if _, allowed := allowedClaudeDocumentMIMETypes[mediaType]; !allowed {
++						return newClaudeRequestPolicyError(path+".source.media_type", "is not an allowed document MIME type")
++					}
++				}
++				rawURL, ok := source["url"].(string)
++				if !ok || rawURL == "" {
++					return newClaudeRequestPolicyError(path+".source.url", "must be a non-empty HTTP or HTTPS URL")
++				}
++				parsed, err := url.Parse(rawURL)
++				if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.User != nil {
++					return newClaudeRequestPolicyError(path+".source.url", "must be an HTTP or HTTPS URL without user information")
++				}
++				if err := rejectUnknownClaudeDocumentSourceFields(source, path+".source", "type", "media_type", "url"); err != nil {
++					return err
++				}
++			default:
++				return newClaudeRequestPolicyError(path+".source.type", "must be base64 or url")
++			}
++		}
++	}
++	return nil
++}
++
++func rejectUnknownClaudeDocumentFields(content map[string]any, path string) error {
++	for name := range content {
++		switch name {
++		case "type", "source", "title":
++		default:
++			return newClaudeRequestPolicyError(path+"."+name, "cannot be preserved safely")
++		}
++	}
++	if rawTitle, exists := content["title"]; exists {
++		if _, ok := rawTitle.(string); !ok {
++			return newClaudeRequestPolicyError(path+".title", "must be a string")
++		}
++	}
++	return nil
++}
++
++func rejectUnknownClaudeDocumentSourceFields(source map[string]any, path string, allowed ...string) error {
++	allowedSet := make(map[string]struct{}, len(allowed))
++	for _, name := range allowed {
++		allowedSet[name] = struct{}{}
++	}
++	for name := range source {
++		if _, ok := allowedSet[name]; !ok {
++			return newClaudeRequestPolicyError(path+"."+name, "cannot be preserved safely")
++		}
++	}
++	return nil
++}
+diff --git a/sdk/api/handlers/claude/request_policy_test.go b/sdk/api/handlers/claude/request_policy_test.go
+new file mode 100644
+index 0000000..c251c57
+--- /dev/null
++++ b/sdk/api/handlers/claude/request_policy_test.go
+@@ -0,0 +1,248 @@
++package claude
++
++import (
++	"encoding/base64"
++	"fmt"
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/gin-gonic/gin"
++	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	"github.com/tidwall/gjson"
++)
++
++func TestPreflightClaudeRequestValidatesMaxTokens(t *testing.T) {
++	for _, value := range []string{`0`, `-1`, `1.5`, `"64"`, `null`} {
++		t.Run(value, func(t *testing.T) {
++			_, err := preflightClaudeRequest([]byte(fmt.Sprintf(`{"model":"test","max_tokens":%s,"messages":[]}`, value)))
++			if err == nil || !strings.Contains(err.Error(), "$.max_tokens") {
++				t.Fatalf("error = %v, want max_tokens policy error", err)
++			}
++		})
++	}
++	policy, err := preflightClaudeRequest([]byte(`{"model":"test","max_tokens":64,"messages":[]}`))
++	if err != nil {
++		t.Fatalf("valid max_tokens rejected: %v", err)
++	}
++	if policy.constraints.maxTokens != 64 {
++		t.Fatalf("maxTokens = %d, want 64", policy.constraints.maxTokens)
++	}
++}
++
++func TestPreflightClaudeRequestTakesStopSequences(t *testing.T) {
++	policy, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"stop_sequences":["END","DONE"],
++		"messages":[{"role":"user","content":"hello"}]
++	}`))
++	if err != nil {
++		t.Fatalf("preflight: %v", err)
++	}
++	if got := strings.Join(policy.constraints.stopSequences, ","); got != "END,DONE" {
++		t.Fatalf("stop sequences = %q", got)
++	}
++	if gjson.GetBytes(policy.rawJSON, "stop_sequences").Exists() {
++		t.Fatalf("locally enforced stop_sequences reached upstream body: %s", policy.rawJSON)
++	}
++}
++
++func TestPreflightClaudeRequestRejectsDeferLoadingTrue(t *testing.T) {
++	_, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"tools":[{"name":"lookup","input_schema":{"type":"object"},"defer_loading":true}],
++		"messages":[]
++	}`))
++	if err == nil || !strings.Contains(err.Error(), "$.tools[0].defer_loading") {
++		t.Fatalf("error = %v", err)
++	}
++
++	policy, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"tools":[{"name":"lookup","input_schema":{"type":"object"},"defer_loading":false}],
++		"messages":[]
++	}`))
++	if err != nil {
++		t.Fatalf("defer_loading=false rejected: %v", err)
++	}
++	if gjson.GetBytes(policy.rawJSON, "tools.0.defer_loading").Exists() {
++		t.Fatalf("defer_loading=false was not removed: %s", policy.rawJSON)
++	}
++}
++
++func TestPreflightClaudeRequestRejectsUnsafeStrictSchemaWithPath(t *testing.T) {
++	_, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"tools":[{
++			"name":"lookup",
++			"strict":true,
++			"input_schema":{"type":"object","properties":{"value":{"type":"string"}},"required":["missing"],"additionalProperties":false}
++		}],
++		"messages":[]
++	}`))
++	if err == nil || !strings.Contains(err.Error(), "$.tools[0].input_schema.required[0]") {
++		t.Fatalf("error = %v, want JSON path", err)
++	}
++}
++
++func TestPreflightClaudeRequestAcceptsStrictSchemaWithoutWeakeningIt(t *testing.T) {
++	policy, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"tools":[{
++			"name":"lookup",
++			"strict":true,
++			"input_schema":{
++				"type":"object",
++				"properties":{"value":{"type":["string","null"]}},
++				"required":["value"],
++				"additionalProperties":false
++			}
++		}],
++		"messages":[]
++	}`))
++	if err != nil {
++		t.Fatalf("valid strict schema rejected: %v", err)
++	}
++	if !gjson.GetBytes(policy.rawJSON, "tools.0.strict").Bool() || gjson.GetBytes(policy.rawJSON, "tools.0.input_schema.properties.value.type.1").String() != "null" {
++		t.Fatalf("strict schema was weakened: %s", policy.rawJSON)
++	}
++}
++
++func TestPreflightClaudeRequestValidatesDocuments(t *testing.T) {
++	validData := base64.StdEncoding.EncodeToString([]byte("pdf"))
++	valid := fmt.Sprintf(`{
++		"model":"test","max_tokens":64,
++		"messages":[{"role":"user","content":[
++			{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":%q}},
++			{"type":"document","source":{"type":"url","url":"https://example.test/file.txt?private=value"}}
++		]}]
++	}`, validData)
++	if _, err := preflightClaudeRequest([]byte(valid)); err != nil {
++		t.Fatalf("valid documents rejected: %v", err)
++	}
++
++	tests := []struct {
++		name   string
++		source string
++		path   string
++	}{
++		{name: "invalid base64", source: `{"type":"base64","media_type":"application/pdf","data":"%%%"}`, path: ".source.data"},
++		{name: "file URL", source: `{"type":"url","media_type":"application/pdf","url":"file:///tmp/private.pdf"}`, path: ".source.url"},
++		{name: "unknown MIME", source: `{"type":"base64","media_type":"application/octet-stream","data":"cGRm"}`, path: ".source.media_type"},
++		{name: "unknown source field", source: `{"type":"base64","media_type":"application/pdf","data":"cGRm","file_id":"secret"}`, path: ".source.file_id"},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			body := fmt.Sprintf(`{"model":"test","max_tokens":64,"messages":[{"role":"user","content":[{"type":"document","source":%s}]}]}`, tt.source)
++			_, err := preflightClaudeRequest([]byte(body))
++			if err == nil || !strings.Contains(err.Error(), tt.path) {
++				t.Fatalf("error = %v, want path %s", err, tt.path)
++			}
++			if strings.Contains(fmt.Sprint(err), "private=value") {
++				t.Fatalf("policy error exposed URL query: %v", err)
++			}
++		})
++	}
++}
++
++func TestPreflightClaudeRequestEnforcesDocumentSizeLimits(t *testing.T) {
++	tooLarge := base64.StdEncoding.EncodeToString(make([]byte, maxClaudeDocumentBytes+1))
++	body := fmt.Sprintf(`{"model":"test","max_tokens":64,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":%q}}]}]}`, tooLarge)
++	if _, err := preflightClaudeRequest([]byte(body)); err == nil || !strings.Contains(err.Error(), "per-document size limit") {
++		t.Fatalf("per-document error = %v", err)
++	}
++
++	first := base64.StdEncoding.EncodeToString(make([]byte, maxClaudeDocumentBytes))
++	second := base64.StdEncoding.EncodeToString(make([]byte, maxClaudeDocumentBytes))
++	third := base64.StdEncoding.EncodeToString([]byte{1})
++	body = fmt.Sprintf(`{"model":"test","max_tokens":64,"messages":[{"role":"user","content":[
++		{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":%q}},
++		{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":%q}},
++		{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":%q}}
++	]}]}`, first, second, third)
++	if _, err := preflightClaudeRequest([]byte(body)); err == nil || !strings.Contains(err.Error(), "total size limit") {
++		t.Fatalf("total-size error = %v", err)
++	}
++}
++
++func TestPreflightClaudeRequestRejectsStrictReferenceKeywords(t *testing.T) {
++	tests := []string{
++		`{"type":"object","properties":{},"required":[],"additionalProperties":false,"$defs":{"unsafe":{"type":"object","additionalProperties":true}}}`,
++		`{"type":"object","properties":{"value":{"$ref":"#/$defs/value"}},"required":["value"],"additionalProperties":false}`,
++	}
++	for _, schema := range tests {
++		body := []byte(`{"model":"test","max_tokens":64,"tools":[{"name":"lookup","strict":true,"input_schema":` + schema + `}],"messages":[]}`)
++		_, err := preflightClaudeRequest(body)
++		if err == nil || (!strings.Contains(err.Error(), ".$defs") && !strings.Contains(err.Error(), ".$ref")) {
++			t.Fatalf("schema reference error = %v", err)
++		}
++	}
++}
++
++func TestClaudeHandlersRejectPolicyBeforeExecution(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++	handler := NewClaudeCodeAPIHandler(&handlers.BaseAPIHandler{})
++	tests := []struct {
++		name string
++		path string
++		body string
++		call func(*gin.Context)
++	}{
++		{
++			name: "messages",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"tools":[{"name":"lookup","input_schema":{"type":"object"},"defer_loading":true}],"messages":[]}`,
++			call: handler.ClaudeMessages,
++		},
++		{
++			name: "count tokens",
++			path: "/v1/messages/count_tokens",
++			body: `{"model":"test","max_tokens":0,"messages":[]}`,
++			call: handler.ClaudeCountTokens,
++		},
++		{
++			name: "unknown context edit",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"context_management":{"edits":[{"type":"unknown"}]},"messages":[]}`,
++			call: handler.ClaudeMessages,
++		},
++		{
++			name: "unsafe strict schema",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"tools":[{"name":"lookup","strict":true,"input_schema":{"type":"object","properties":{},"additionalProperties":true}}],"messages":[]}`,
++			call: handler.ClaudeMessages,
++		},
++		{
++			name: "invalid document",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"messages":[{"role":"user","content":[{"type":"document","source":{"type":"url","media_type":"application/pdf","url":"file:///tmp/private.pdf"}}]}]}`,
++			call: handler.ClaudeMessages,
++		},
++		{
++			name: "invalid stop sequence",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"stop_sequences":[""],"messages":[]}`,
++			call: handler.ClaudeMessages,
++		},
++	}
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			recorder := httptest.NewRecorder()
++			ctx, _ := gin.CreateTestContext(recorder)
++			ctx.Request = httptest.NewRequest(http.MethodPost, tt.path, strings.NewReader(tt.body))
++			tt.call(ctx)
++			if recorder.Code != http.StatusBadRequest {
++				t.Fatalf("status = %d, want 400; body=%s", recorder.Code, recorder.Body.String())
++			}
++			if got := gjson.GetBytes(recorder.Body.Bytes(), "error.type").String(); got != "invalid_request_error" {
++				t.Fatalf("error.type = %q; body=%s", got, recorder.Body.String())
++			}
++		})
++	}
++}

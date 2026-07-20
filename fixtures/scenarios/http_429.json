@@ -1,0 +1,6 @@
+{
+  "name": "http_429",
+  "status": 429,
+  "headers": {"Retry-After": "1"},
+  "json": {"error": {"type": "rate_limit_error", "code": "synthetic_429"}}
+}

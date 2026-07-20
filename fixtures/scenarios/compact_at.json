@@ -1,0 +1,134 @@
+{
+  "name": "compact_at",
+  "request_hash_placeholders": true,
+  "status": 200,
+  "sse_events": [
+    {
+      "event": "response.created",
+      "data": {
+        "type": "response.created",
+        "response": {
+          "id": "resp_compact_at_{{request_sha12}}",
+          "object": "response",
+          "status": "in_progress",
+          "model": "compact_at",
+          "output": []
+        }
+      }
+    },
+    {
+      "event": "response.output_item.added",
+      "data": {
+        "type": "response.output_item.added",
+        "output_index": 0,
+        "item": {
+          "id": "msg_compact_at_{{request_sha12}}",
+          "type": "message",
+          "status": "in_progress",
+          "role": "assistant",
+          "content": []
+        }
+      }
+    },
+    {
+      "event": "response.content_part.added",
+      "data": {
+        "type": "response.content_part.added",
+        "item_id": "msg_compact_at_{{request_sha12}}",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "text": "",
+          "annotations": []
+        }
+      }
+    },
+    {
+      "event": "response.output_text.delta",
+      "data": {
+        "type": "response.output_text.delta",
+        "item_id": "msg_compact_at_{{request_sha12}}",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": "compact at"
+      }
+    },
+    {
+      "event": "response.output_text.done",
+      "data": {
+        "type": "response.output_text.done",
+        "item_id": "msg_compact_at_{{request_sha12}}",
+        "output_index": 0,
+        "content_index": 0,
+        "text": "compact at"
+      }
+    },
+    {
+      "event": "response.content_part.done",
+      "data": {
+        "type": "response.content_part.done",
+        "item_id": "msg_compact_at_{{request_sha12}}",
+        "output_index": 0,
+        "content_index": 0,
+        "part": {
+          "type": "output_text",
+          "text": "compact at",
+          "annotations": []
+        }
+      }
+    },
+    {
+      "event": "response.output_item.done",
+      "data": {
+        "type": "response.output_item.done",
+        "output_index": 0,
+        "item": {
+          "id": "msg_compact_at_{{request_sha12}}",
+          "type": "message",
+          "status": "completed",
+          "role": "assistant",
+          "content": [
+            {
+              "type": "output_text",
+              "text": "compact at",
+              "annotations": []
+            }
+          ]
+        }
+      }
+    },
+    {
+      "event": "response.completed",
+      "data": {
+        "type": "response.completed",
+        "response": {
+          "id": "resp_compact_at_{{request_sha12}}",
+          "object": "response",
+          "status": "completed",
+          "model": "compact_at",
+          "output": [
+            {
+              "id": "msg_compact_at_{{request_sha12}}",
+              "type": "message",
+              "status": "completed",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "compact at",
+                  "annotations": []
+                }
+              ]
+            }
+          ],
+          "usage": {
+            "input_tokens": 4000,
+            "output_tokens": 62996,
+            "total_tokens": 66996
+          }
+        }
+      }
+    }
+  ]
+}

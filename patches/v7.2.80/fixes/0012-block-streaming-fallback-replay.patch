@@ -1,0 +1,101 @@
+diff --git a/internal/claudegateway/gateway.go b/internal/claudegateway/gateway.go
+--- a/internal/claudegateway/gateway.go
++++ b/internal/claudegateway/gateway.go
+@@ -385,7 +385,7 @@ func readLimited(reader io.Reader, limit int64) ([]byte, error) {
+ }
+ 
+ func requestFingerprint(request *http.Request, body []byte) [32]byte {
+-	canonicalBody, model, stream := canonicalRequestBody(body)
++	canonicalBody, model := canonicalRequestFingerprintBody(body)
+ 	bodyHash := sha256.Sum256(canonicalBody)
+ 	hash := sha256.New()
+ 	_, _ = io.WriteString(hash, request.Method)
+@@ -405,13 +405,25 @@ func requestFingerprint(request *http.Request, body []byte) [32]byte {
+ 	}
+ 	_, _ = io.WriteString(hash, "model:")
+ 	_, _ = io.WriteString(hash, model)
+-	_, _ = io.WriteString(hash, "\nstream:")
+-	_, _ = io.WriteString(hash, strconv.FormatBool(stream))
+ 	_, _ = io.WriteString(hash, "\nbody-sha256:")
+ 	_, _ = io.WriteString(hash, fmt.Sprintf("%x", bodyHash[:]))
+ 	var result [32]byte
+ 	copy(result[:], hash.Sum(nil))
+ 	return result
++}
++
++func canonicalRequestFingerprintBody(body []byte) ([]byte, string) {
++	canonical, model, _ := canonicalRequestBody(body)
++	var envelope map[string]any
++	if json.Unmarshal(canonical, &envelope) != nil {
++		return canonical, model
++	}
++	delete(envelope, "stream")
++	normalized, err := json.Marshal(envelope)
++	if err != nil {
++		return canonical, model
++	}
++	return normalized, model
+ }
+ 
+ func retryableStatus(status int) bool {
+diff --git a/internal/claudegateway/gateway_test.go b/internal/claudegateway/gateway_test.go
+--- a/internal/claudegateway/gateway_test.go
++++ b/internal/claudegateway/gateway_test.go
+@@ -154,7 +154,33 @@ func TestGatewayBlocksRetryAfterIncompleteStream(t *testing.T) {
+ 	status, _ = postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
+ 	if status != http.StatusFailedDependency {
+ 		t.Fatalf("duplicate partial response status = %d, want 424", status)
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayBlocksStreamingFallbackAfterIncompleteNonStreamingRequest(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n")
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[]}`))
++	if status != http.StatusOK {
++		t.Fatalf("first partial response status = %d, want 200", status)
+ 	}
++	status, _ = postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[],"stream":true}`))
++	if status != http.StatusFailedDependency {
++		t.Fatalf("streaming fallback status = %d, want 424", status)
++	}
+ 	if got := calls.Load(); got != 1 {
+ 		t.Fatalf("upstream calls = %d, want 1", got)
+ 	}
+@@ -225,7 +251,23 @@ func TestGatewayFingerprintCanonicalizesJSONBody(t *testing.T) {
+ 	requestB.Header.Set("Content-Type", "application/json")
+ 	if got, want := requestFingerprint(requestA, []byte(`{"model":"test","stream":true,"metadata":{"b":2,"a":1}}`)), requestFingerprint(requestB, []byte("{\n  \"metadata\": {\"a\": 1, \"b\": 2},\n  \"stream\": true,\n  \"model\": \"test\"\n}")); got != want {
+ 		t.Fatalf("semantically identical JSON requests produced different fingerprints")
++	}
++}
++
++func TestGatewayFingerprintTreatsStreamingFallbackAsSameSemanticRequest(t *testing.T) {
++	requestA, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:9000/v1/messages", bytes.NewBufferString(`{"model":"test","messages":[]}`))
++	if err != nil {
++		t.Fatalf("NewRequest A: %v", err)
+ 	}
++	requestB, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:9000/v1/messages", bytes.NewBufferString(`{"model":"test","messages":[],"stream":true}`))
++	if err != nil {
++		t.Fatalf("NewRequest B: %v", err)
++	}
++	requestA.Header.Set("Content-Type", "application/json")
++	requestB.Header.Set("Content-Type", "application/json")
++	if got, want := requestFingerprint(requestA, []byte(`{"model":"test","messages":[]}`)), requestFingerprint(requestB, []byte(`{"model":"test","messages":[],"stream":true}`)); got != want {
++		t.Fatal("streaming fallback produced a distinct semantic fingerprint")
++	}
+ }
+ 
+ func TestGatewayRejectsRepeatedToolIDAcrossDistinctRequests(t *testing.T) {

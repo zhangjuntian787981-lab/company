@@ -1,0 +1,225 @@
+{
+  "schema_version": 2,
+  "source_tag": "v7.2.80",
+  "source_repository": "https://github.com/router-for-me/CLIProxyAPI.git",
+  "source_commit": "09da52ad509e2c18e7b9540db3b98c2214c280aa",
+  "patches": [
+    {
+      "id": "protocol-boundary-tests",
+      "path": "protocol-boundary-tests.patch",
+      "sha256": "1a024b95b698494b88f715d6edb9ee8688aa0402de534cd6b84e4492d75d5076",
+      "touched_paths": [
+        "internal/runtime/executor/compat_protocol_boundary_test.go",
+        "internal/translator/codex/claude/compat_protocol_boundary_test.go"
+      ],
+      "contracts": [
+        "tool-argument-delta-call-id-isolation",
+        "terminal-response-incomplete",
+        "terminal-response-failed",
+        "terminal-missing-after-partial-output",
+        "terminal-first-byte-transport-break",
+        "stop-reason-mapping",
+        "terminal-max-output-tokens",
+        "adaptive-effort-default",
+        "adaptive-effort-levels"
+      ]
+    },
+    {
+      "id": "fix-parallel-claude-tool-state",
+      "path": "fixes/0001-fix-parallel-claude-tool-state.patch",
+      "sha256": "0eebc30b4fad61e968a0a24d1b5a7c9a2c97b10f4bc029df6a0c604cee3ad544",
+      "touched_paths": [
+        "internal/translator/codex/claude/codex_claude_response.go",
+        "internal/translator/codex/claude/codex_claude_response_test.go"
+      ],
+      "contracts": [
+        "tool-argument-delta-call-id-isolation"
+      ]
+    },
+    {
+      "id": "add-claude-request-attempt-budget",
+      "path": "fixes/0002-add-claude-request-attempt-budget.patch",
+      "sha256": "703e9022c9c459f354f7e7666b8395f5e52657a2d671eb14af7ecc13fc6e6620",
+      "touched_paths": [
+        "sdk/cliproxy/auth/request_budget.go",
+        "sdk/cliproxy/auth/request_budget_test.go",
+        "sdk/cliproxy/auth/conductor.go",
+        "sdk/api/handlers/handlers.go",
+        "sdk/api/handlers/claude/code_handlers.go"
+      ],
+      "contracts": [
+        "claude-request-attempt-budget"
+      ]
+    },
+    {
+      "id": "add-claude-invocation-gateway",
+      "path": "fixes/0003-add-claude-invocation-gateway.patch",
+      "sha256": "37e19db080e3a27dc482240a681a8898bae7dedc9fa400326e8684b2b5e2e8d9",
+      "touched_paths": [
+        "cmd/claude-budget-gateway/main.go",
+        "internal/claudegateway/gateway.go",
+        "internal/claudegateway/gateway_test.go"
+      ],
+      "contracts": [
+        "claude-invocation-gateway"
+      ]
+    },
+    {
+      "id": "fix-claude-request-mapping",
+      "path": "fixes/0004-fix-claude-request-mapping.patch",
+      "sha256": "31a5e771f3483250acbc98e2f7706ddc99961746d66aaf12bd27cbb6b503b43a",
+      "touched_paths": [
+        "internal/translator/codex/claude/codex_claude_request.go",
+        "internal/translator/codex/claude/codex_claude_request_test.go"
+      ],
+      "contracts": [
+        "request-max-tokens",
+        "tool-strict",
+        "request-document-block",
+        "request-stop-sequences"
+      ]
+    },
+    {
+      "id": "fix-terminal-tool-event-idempotency",
+      "path": "fixes/0005-fix-terminal-tool-event-idempotency.patch",
+      "sha256": "7cfc8d76263182915268a0d495ac3361e26772b271b9bf3bead994d4c79986fe",
+      "touched_paths": [
+        "internal/translator/codex/claude/codex_claude_response.go",
+        "internal/translator/codex/claude/codex_claude_response_test.go"
+      ],
+      "contracts": [
+        "tool-argument-delta-call-id-isolation",
+        "terminal-tool-event-idempotency"
+      ]
+    },
+    {
+      "id": "enforce-claude-handler-contracts",
+      "path": "fixes/0006-enforce-claude-handler-contracts.patch",
+      "sha256": "05dbbd5cffa1695ae0581540fb5f5ca22808e2f4f9db5306bf3b32fb006b1805",
+      "touched_paths": [
+        "internal/api/server_test.go",
+        "sdk/api/handlers/claude/code_handlers.go",
+        "sdk/api/handlers/claude/code_handlers_model_test.go",
+        "sdk/api/handlers/claude/context_management.go",
+        "sdk/api/handlers/claude/context_management_test.go",
+        "sdk/api/handlers/claude/output_constraints.go",
+        "sdk/api/handlers/claude/output_constraints_test.go",
+        "sdk/api/handlers/claude/request_policy.go",
+        "sdk/api/handlers/claude/request_policy_test.go"
+      ],
+      "contracts": [
+        "request-max-tokens",
+        "request-stop-sequences",
+        "request-context-management",
+        "tool-strict",
+        "tool-defer-loading",
+        "request-document-block",
+        "claude-model-catalog-aliases"
+      ]
+    },
+    {
+      "id": "complete-claude-request-attempt-budget",
+      "path": "fixes/0007-complete-claude-request-attempt-budget.patch",
+      "sha256": "e3da3320fed864b73483bdf2bbe0d96212a349c592f839daf9dfeb36d9afcaf2",
+      "touched_paths": [
+        "internal/runtime/executor/claude_executor.go",
+        "internal/runtime/executor/codex_executor.go",
+        "sdk/cliproxy/auth/request_budget.go",
+        "sdk/cliproxy/auth/request_budget_test.go"
+      ],
+      "contracts": [
+        "claude-request-attempt-budget"
+      ]
+    },
+    {
+      "id": "harden-claude-invocation-gateway",
+      "path": "fixes/0008-harden-claude-invocation-gateway.patch",
+      "sha256": "9964c91cc73bdd5b44a6497a186a940b446097f546cb5145e5188bd9b457d0e2",
+      "touched_paths": [
+        "internal/claudegateway/gateway.go",
+        "internal/claudegateway/gateway_test.go"
+      ],
+      "contracts": [
+        "claude-invocation-gateway"
+      ]
+    },
+    {
+      "id": "harden-synthetic-oauth-refresh",
+      "path": "fixes/0009-harden-synthetic-oauth-refresh.patch",
+      "sha256": "e10a8c114cd9848adaf327fc88b88da4e35967bb79350d596c58792fdab0622f",
+      "touched_paths": [
+        "internal/auth/claude/anthropic_auth.go",
+        "internal/auth/claude/anthropic_auth_test.go",
+        "internal/auth/codex/openai_auth.go",
+        "internal/auth/codex/openai_auth_test.go",
+        "sdk/auth/filestore.go",
+        "sdk/auth/filestore_oauth_safety_test.go",
+        "sdk/cliproxy/auth/conductor_unauthorized_refresh_test.go"
+      ],
+      "contracts": [
+        "oauth-refresh-synthetic-safety"
+      ]
+    },
+    {
+      "id": "accept-claude-code-clear-thinking-keep-all",
+      "path": "fixes/0010-accept-claude-code-clear-thinking-keep-all.patch",
+      "sha256": "b4ca443934952fcdaf9520cb0add580eaed1b95737b0ece6df18b09ce556d328",
+      "touched_paths": [
+        "sdk/api/handlers/claude/context_management.go",
+        "sdk/api/handlers/claude/context_management_test.go",
+        "sdk/api/handlers/claude/request_policy_test.go"
+      ],
+      "contracts": [
+        "request-context-management"
+      ]
+    },
+    {
+      "id": "serialize-parallel-claude-tool-blocks",
+      "path": "fixes/0011-serialize-parallel-claude-tool-blocks.patch",
+      "sha256": "322ace8bc7444afc2f1a3288be925a115f8287b73300becad0b8463e8d82b7a1",
+      "touched_paths": [
+        "internal/translator/codex/claude/codex_claude_response.go",
+        "internal/translator/codex/claude/codex_claude_response_test.go"
+      ],
+      "contracts": [
+        "tool-argument-delta-call-id-isolation",
+        "terminal-tool-event-idempotency"
+      ]
+    },
+    {
+      "id": "block-streaming-fallback-replay",
+      "path": "fixes/0012-block-streaming-fallback-replay.patch",
+      "sha256": "5ed767dfefe6dbbec249494f1dfb9822bdd1bf0ea70215c4f2df2b426d337882",
+      "touched_paths": [
+        "internal/claudegateway/gateway.go",
+        "internal/claudegateway/gateway_test.go"
+      ],
+      "contracts": [
+        "claude-invocation-gateway"
+      ]
+    }
+  ],
+  "baseline_packages": [
+    "./internal/auth/claude",
+    "./internal/auth/codex",
+    "./internal/translator/codex/claude",
+    "./internal/api",
+    "./internal/runtime/executor",
+    "./sdk/api/handlers/claude",
+    "./sdk/auth",
+    "./sdk/cliproxy/auth"
+  ],
+  "supplemental_packages": [
+    "./internal/auth/claude",
+    "./internal/auth/codex",
+    "./internal/translator/codex/claude",
+    "./internal/api",
+    "./internal/runtime/executor",
+    "./sdk/api/handlers/claude",
+    "./sdk/auth",
+    "./sdk/cliproxy/auth",
+    "./internal/claudegateway",
+    "./cmd/claude-budget-gateway"
+  ],
+  "known_defect_tests": []
+}

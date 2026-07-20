@@ -1,0 +1,507 @@
+diff --git a/internal/claudegateway/gateway.go b/internal/claudegateway/gateway.go
+index a1e36fa..6796e61 100644
+--- a/internal/claudegateway/gateway.go
++++ b/internal/claudegateway/gateway.go
+@@ -37,6 +37,7 @@ type Gateway struct {
+ 
+ 	mu      sync.Mutex
+ 	entries map[[32]byte]*ledgerEntry
++	tools   map[string]toolLedgerEntry
+ }
+ 
+ type ledgerEntry struct {
+@@ -49,10 +50,30 @@ type ledgerEntry struct {
+ 
+ type streamEvent struct {
+ 	Type         string `json:"type"`
++	Index        int    `json:"index"`
+ 	ContentBlock struct {
+-		Type string `json:"type"`
+-		ID   string `json:"id"`
++		Type  string          `json:"type"`
++		ID    string          `json:"id"`
++		Name  string          `json:"name"`
++		Input json.RawMessage `json:"input"`
+ 	} `json:"content_block"`
++	Delta struct {
++		Type        string `json:"type"`
++		PartialJSON string `json:"partial_json"`
++	} `json:"delta"`
++}
++
++type toolLedgerEntry struct {
++	name          string
++	argumentsHash [32]byte
++	resultSeen    bool
++}
++
++type pendingToolBlock struct {
++	id           string
++	name         string
++	initialInput json.RawMessage
++	partialJSON  bytes.Buffer
+ }
+ 
+ // ParseTarget validates a non-production loopback HTTP target.
+@@ -120,6 +141,7 @@ func New(config Config) (*Gateway, error) {
+ 		maxRequestBytes: config.MaxRequestBodyBytes,
+ 		maxReplayBytes:  config.MaxReplayBytes,
+ 		entries:         make(map[[32]byte]*ledgerEntry),
++		tools:           make(map[string]toolLedgerEntry),
+ 	}, nil
+ }
+ 
+@@ -130,6 +152,7 @@ func (g *Gateway) ServeHTTP(w http.ResponseWriter, request *http.Request) {
+ 		writeClaudeError(w, http.StatusRequestEntityTooLarge, "request body exceeds gateway limit")
+ 		return
+ 	}
++	g.observeToolResults(body)
+ 	key := requestFingerprint(request, body)
+ 	entry, owner := g.acquire(key)
+ 	if !owner {
+@@ -196,6 +219,11 @@ func (g *Gateway) forwardOwner(w http.ResponseWriter, request *http.Request, bod
+ 		writeStoredResponse(w, entry)
+ 		return
+ 	}
++	if err = g.claimJSONToolUses(responseBody); err != nil {
++		g.completeError(entry, http.StatusFailedDependency, err.Error())
++		writeStoredResponse(w, entry)
++		return
++	}
+ 	copyHeaders(w.Header(), header)
+ 	w.WriteHeader(response.StatusCode)
+ 	_, _ = w.Write(responseBody)
+@@ -207,8 +235,6 @@ func (g *Gateway) forwardOwner(w http.ResponseWriter, request *http.Request, bod
+ }
+ 
+ func (g *Gateway) forwardSSE(w http.ResponseWriter, response *http.Response, entry *ledgerEntry, header http.Header) {
+-	copyHeaders(w.Header(), header)
+-	w.WriteHeader(response.StatusCode)
+ 	flusher, _ := w.(http.Flusher)
+ 
+ 	reader := bufio.NewReader(response.Body)
+@@ -216,33 +242,106 @@ func (g *Gateway) forwardSSE(w http.ResponseWriter, response *http.Response, ent
+ 	captureEnabled := true
+ 	terminalSeen := false
+ 	toolUseSeen := false
++	responseStarted := false
++	prelude := make([]byte, 0, 1024)
++	toolBuffer := make([]byte, 0, 4096)
++	pendingTools := make(map[int]*pendingToolBlock)
++
++	startResponse := func() {
++		if responseStarted {
++			return
++		}
++		copyHeaders(w.Header(), header)
++		w.WriteHeader(response.StatusCode)
++		responseStarted = true
++	}
++	writeClient := func(data []byte) {
++		if len(data) == 0 {
++			return
++		}
++		startResponse()
++		_, _ = w.Write(data)
++		if flusher != nil {
++			flusher.Flush()
++		}
++	}
++	failToolProtocol := func(message string) {
++		g.completeError(entry, http.StatusFailedDependency, message)
++		if !responseStarted {
++			writeStoredResponse(w, entry)
++		}
++	}
+ 
+ 	for {
+-		line, errRead := reader.ReadBytes('\n')
+-		if len(line) > 0 {
++		frame, errRead := readSSEFrame(reader)
++		if len(frame) > 0 {
+ 			if captureEnabled {
+-				if int64(len(captured)+len(line)) > g.maxReplayBytes {
++				if int64(len(captured)+len(frame)) > g.maxReplayBytes {
+ 					captureEnabled = false
+ 					captured = nil
+ 				} else {
+-					captured = append(captured, line...)
++					captured = append(captured, frame...)
+ 				}
+ 			}
+-			if event, ok := parseSSEEvent(line); ok {
++			event, parsed := parseSSEEvent(frame)
++			if parsed {
+ 				if event.Type == "message_stop" {
+ 					terminalSeen = true
+ 				}
+ 				if event.Type == "content_block_start" && event.ContentBlock.Type == "tool_use" {
+ 					toolUseSeen = true
++					pendingTools[event.Index] = &pendingToolBlock{
++						id:           strings.TrimSpace(event.ContentBlock.ID),
++						name:         strings.TrimSpace(event.ContentBlock.Name),
++						initialInput: bytes.Clone(event.ContentBlock.Input),
++					}
++					if len(toolBuffer) == 0 {
++						toolBuffer = append(toolBuffer, prelude...)
++						prelude = nil
++					}
++				}
++				if event.Type == "content_block_delta" {
++					if pending := pendingTools[event.Index]; pending != nil && event.Delta.Type == "input_json_delta" {
++						_, _ = pending.partialJSON.WriteString(event.Delta.PartialJSON)
++					}
++				}
++				if event.Type == "content_block_stop" {
++					if pending := pendingTools[event.Index]; pending != nil {
++						arguments := pending.initialInput
++						if pending.partialJSON.Len() > 0 {
++							arguments = pending.partialJSON.Bytes()
++						}
++						if len(arguments) == 0 {
++							arguments = []byte(`{}`)
++						}
++						if errClaim := g.claimToolUse(pending.id, pending.name, arguments); errClaim != nil {
++							failToolProtocol(errClaim.Error())
++							return
++						}
++						delete(pendingTools, event.Index)
++					}
+ 				}
+ 			}
+-			_, _ = w.Write(line)
+-			if flusher != nil {
+-				flusher.Flush()
++
++			if len(toolBuffer) > 0 || len(pendingTools) > 0 {
++				toolBuffer = append(toolBuffer, frame...)
++				if len(pendingTools) == 0 {
++					writeClient(toolBuffer)
++					toolBuffer = nil
++				}
++			} else if !responseStarted {
++				prelude = append(prelude, frame...)
++				if parsed && (event.Type == "content_block_start" || event.Type == "message_stop") {
++					writeClient(prelude)
++					prelude = nil
++				}
++			} else {
++				writeClient(frame)
+ 			}
+ 		}
+ 		if errRead != nil {
+ 			if errors.Is(errRead, io.EOF) && terminalSeen {
++				writeClient(prelude)
+ 				if toolUseSeen || !captureEnabled {
+ 					g.completeError(entry, http.StatusFailedDependency, "duplicate request blocked after a non-replayable streaming response")
+ 				} else {
+@@ -286,6 +385,8 @@ func readLimited(reader io.Reader, limit int64) ([]byte, error) {
+ }
+ 
+ func requestFingerprint(request *http.Request, body []byte) [32]byte {
++	canonicalBody, model, stream := canonicalRequestBody(body)
++	bodyHash := sha256.Sum256(canonicalBody)
+ 	hash := sha256.New()
+ 	_, _ = io.WriteString(hash, request.Method)
+ 	_, _ = io.WriteString(hash, "\n")
+@@ -302,7 +403,12 @@ func requestFingerprint(request *http.Request, body []byte) [32]byte {
+ 		}
+ 		_, _ = io.WriteString(hash, "\n")
+ 	}
+-	_, _ = hash.Write(body)
++	_, _ = io.WriteString(hash, "model:")
++	_, _ = io.WriteString(hash, model)
++	_, _ = io.WriteString(hash, "\nstream:")
++	_, _ = io.WriteString(hash, strconv.FormatBool(stream))
++	_, _ = io.WriteString(hash, "\nbody-sha256:")
++	_, _ = io.WriteString(hash, fmt.Sprintf("%x", bodyHash[:]))
+ 	var result [32]byte
+ 	copy(result[:], hash.Sum(nil))
+ 	return result
+@@ -316,11 +422,14 @@ func retryableStatus(status int) bool {
+ }
+ 
+ func parseSSEEvent(line []byte) (streamEvent, bool) {
+-	trimmed := bytes.TrimSpace(line)
+-	if !bytes.HasPrefix(trimmed, []byte("data:")) {
+-		return streamEvent{}, false
++	var dataLines [][]byte
++	for _, rawLine := range bytes.Split(line, []byte("\n")) {
++		trimmed := bytes.TrimSpace(rawLine)
++		if bytes.HasPrefix(trimmed, []byte("data:")) {
++			dataLines = append(dataLines, bytes.TrimSpace(trimmed[len("data:"):]))
++		}
+ 	}
+-	data := bytes.TrimSpace(trimmed[len("data:"):])
++	data := bytes.Join(dataLines, []byte("\n"))
+ 	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
+ 		return streamEvent{}, false
+ 	}
+@@ -331,6 +440,131 @@ func parseSSEEvent(line []byte) (streamEvent, bool) {
+ 	return event, true
+ }
+ 
++func readSSEFrame(reader *bufio.Reader) ([]byte, error) {
++	var frame []byte
++	for {
++		line, err := reader.ReadBytes('\n')
++		frame = append(frame, line...)
++		if len(bytes.TrimSpace(line)) == 0 && len(frame) > 0 {
++			return frame, err
++		}
++		if err != nil {
++			return frame, err
++		}
++	}
++}
++
++func canonicalRequestBody(body []byte) ([]byte, string, bool) {
++	decoder := json.NewDecoder(bytes.NewReader(body))
++	decoder.UseNumber()
++	var value any
++	if err := decoder.Decode(&value); err != nil {
++		return body, "", false
++	}
++	canonical, err := json.Marshal(value)
++	if err != nil {
++		return body, "", false
++	}
++	var envelope struct {
++		Model  string `json:"model"`
++		Stream bool   `json:"stream"`
++	}
++	_ = json.Unmarshal(canonical, &envelope)
++	return canonical, envelope.Model, envelope.Stream
++}
++
++func (g *Gateway) claimJSONToolUses(body []byte) error {
++	var response struct {
++		Content []struct {
++			Type  string          `json:"type"`
++			ID    string          `json:"id"`
++			Name  string          `json:"name"`
++			Input json.RawMessage `json:"input"`
++		} `json:"content"`
++	}
++	if err := json.Unmarshal(body, &response); err != nil {
++		return nil
++	}
++	for _, block := range response.Content {
++		if block.Type != "tool_use" {
++			continue
++		}
++		arguments := block.Input
++		if len(arguments) == 0 {
++			arguments = []byte(`{}`)
++		}
++		if err := g.claimToolUse(block.ID, block.Name, arguments); err != nil {
++			return err
++		}
++	}
++	return nil
++}
++
++func (g *Gateway) claimToolUse(id, name string, arguments []byte) error {
++	id = strings.TrimSpace(id)
++	name = strings.TrimSpace(name)
++	if id == "" || name == "" {
++		return errors.New("tool response omitted its id or name")
++	}
++	if !json.Valid(arguments) {
++		return fmt.Errorf("tool %s emitted invalid JSON arguments", id)
++	}
++	canonical, _, _ := canonicalRequestBody(arguments)
++	argumentsHash := sha256.Sum256(canonical)
++
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	existing, ok := g.tools[id]
++	if !ok {
++		g.tools[id] = toolLedgerEntry{name: name, argumentsHash: argumentsHash}
++		return nil
++	}
++	if existing.name != name || existing.argumentsHash != argumentsHash {
++		return fmt.Errorf("tool id %s was reused with different arguments", id)
++	}
++	return fmt.Errorf("tool id %s was emitted more than once", id)
++}
++
++func (g *Gateway) observeToolResults(body []byte) {
++	var value any
++	if json.Unmarshal(body, &value) != nil {
++		return
++	}
++	ids := make(map[string]struct{})
++	collectToolResultIDs(value, ids)
++	if len(ids) == 0 {
++		return
++	}
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	for id := range ids {
++		entry, ok := g.tools[id]
++		if !ok {
++			continue
++		}
++		entry.resultSeen = true
++		g.tools[id] = entry
++	}
++}
++
++func collectToolResultIDs(value any, ids map[string]struct{}) {
++	switch item := value.(type) {
++	case map[string]any:
++		if item["type"] == "tool_result" {
++			if id, ok := item["tool_use_id"].(string); ok && strings.TrimSpace(id) != "" {
++				ids[strings.TrimSpace(id)] = struct{}{}
++			}
++		}
++		for _, child := range item {
++			collectToolResultIDs(child, ids)
++		}
++	case []any:
++		for _, child := range item {
++			collectToolResultIDs(child, ids)
++		}
++	}
++}
++
+ func responseContainsToolUse(body []byte) bool {
+ 	var response struct {
+ 		Content []struct {
+diff --git a/internal/claudegateway/gateway_test.go b/internal/claudegateway/gateway_test.go
+index 7bd697a..61d21fb 100644
+--- a/internal/claudegateway/gateway_test.go
++++ b/internal/claudegateway/gateway_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"io"
+ 	"net/http"
+ 	"net/http/httptest"
++	"strconv"
+ 	"sync"
+ 	"sync/atomic"
+ 	"testing"
+@@ -211,6 +212,123 @@ func TestGatewayFingerprintIgnoresRetryMetadata(t *testing.T) {
+ 	}
+ }
+ 
++func TestGatewayFingerprintCanonicalizesJSONBody(t *testing.T) {
++	requestA, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:9000/v1/messages", bytes.NewBufferString(`{"model":"test","stream":true,"metadata":{"b":2,"a":1}}`))
++	if err != nil {
++		t.Fatalf("NewRequest A: %v", err)
++	}
++	requestB, err := http.NewRequest(http.MethodPost, "http://127.0.0.1:9000/v1/messages", bytes.NewBufferString("{\n  \"metadata\": {\"a\": 1, \"b\": 2},\n  \"stream\": true,\n  \"model\": \"test\"\n}"))
++	if err != nil {
++		t.Fatalf("NewRequest B: %v", err)
++	}
++	requestA.Header.Set("Content-Type", "application/json")
++	requestB.Header.Set("Content-Type", "application/json")
++	if got, want := requestFingerprint(requestA, []byte(`{"model":"test","stream":true,"metadata":{"b":2,"a":1}}`)), requestFingerprint(requestB, []byte("{\n  \"metadata\": {\"a\": 1, \"b\": 2},\n  \"stream\": true,\n  \"model\": \"test\"\n}")); got != want {
++		t.Fatalf("semantically identical JSON requests produced different fingerprints")
++	}
++}
++
++func TestGatewayRejectsRepeatedToolIDAcrossDistinctRequests(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"tool_use","id":"tool_1","name":"mutate","input":{"value":1}}]}`)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[{"role":"user","content":"first"}]}`))
++	if status != http.StatusOK {
++		t.Fatalf("first tool response status = %d, want 200", status)
++	}
++	status, body := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[{"role":"user","content":"second"}]}`))
++	if status != http.StatusFailedDependency || !bytes.Contains(body, []byte("emitted more than once")) {
++		t.Fatalf("duplicate tool response = %d/%q, want 424 duplicate error", status, body)
++	}
++	if got := calls.Load(); got != 2 {
++		t.Fatalf("upstream calls = %d, want 2 distinct requests", got)
++	}
++}
++
++func TestGatewayRejectsToolIDWithChangedArguments(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		value := calls.Add(1)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"tool_use","id":"tool_1","name":"mutate","input":{"value":`+strconv.FormatInt(value, 10)+`}}]}`)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[{"role":"user","content":"first"}]}`))
++	if status != http.StatusOK {
++		t.Fatalf("first tool response status = %d, want 200", status)
++	}
++	status, body := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[{"role":"user","content":"second"}]}`))
++	if status != http.StatusFailedDependency || !bytes.Contains(body, []byte("different arguments")) {
++		t.Fatalf("changed tool response = %d/%q, want 424 conflict error", status, body)
++	}
++}
++
++func TestGatewayBuffersStreamingToolBeforeDuplicateCheck(t *testing.T) {
++	stream := "data: {\"type\":\"message_start\"}\n\n" +
++		"data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"mutate\",\"input\":{}}}\n\n" +
++		"data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"value\\\":1}\"}}\n\n" +
++		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
++		"data: {\"type\":\"message_stop\"}\n\n"
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, stream)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true,"request":1}`))
++	if status != http.StatusOK {
++		t.Fatalf("first stream status = %d, want 200", status)
++	}
++	status, body := postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true,"request":2}`))
++	if status != http.StatusFailedDependency || bytes.Contains(body, []byte(`"tool_use"`)) {
++		t.Fatalf("duplicate stream = %d/%q, want 424 before tool bytes", status, body)
++	}
++}
++
++func TestGatewayMarksObservedToolResult(t *testing.T) {
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = io.WriteString(w, `{"type":"message","content":[{"type":"text","text":"done"}]}`)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	if err := gateway.claimToolUse("tool_1", "mutate", []byte(`{"value":1}`)); err != nil {
++		t.Fatalf("claimToolUse: %v", err)
++	}
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"tool_1","content":"ok"}]}]}`))
++	if status != http.StatusOK {
++		t.Fatalf("tool result request status = %d, want 200", status)
++	}
++	gateway.mu.Lock()
++	resultSeen := gateway.tools["tool_1"].resultSeen
++	gateway.mu.Unlock()
++	if !resultSeen {
++		t.Fatal("tool result was not recorded in the invocation ledger")
++	}
++}
++
+ func TestGatewaySetsOnlyConnectionTimeout(t *testing.T) {
+ 	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+ 	defer target.Close()

@@ -1,0 +1,664 @@
+diff --git a/sdk/api/handlers/claude/code_handlers.go b/sdk/api/handlers/claude/code_handlers.go
+index e9bdd60..cd31f19 100644
+--- a/sdk/api/handlers/claude/code_handlers.go
++++ b/sdk/api/handlers/claude/code_handlers.go
+@@ -24,6 +24,7 @@ import (
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+ 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers"
++	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+ 	log "github.com/sirupsen/logrus"
+ 	"github.com/tidwall/gjson"
+ 	"github.com/tidwall/sjson"
+@@ -54,6 +55,20 @@ func (h *ClaudeCodeAPIHandler) HandlerType() string {
+ 	return Claude
+ }
+ 
++func withClaudeGenerationBudget(ctx context.Context) context.Context {
++	return coreauth.WithRequestBudget(ctx, coreauth.RequestBudgetLimits{
++		GenerationAttempts: 2,
++		RefreshAttempts:    1,
++	})
++}
++
++func withClaudeCountBudget(ctx context.Context) context.Context {
++	return coreauth.WithRequestBudget(ctx, coreauth.RequestBudgetLimits{
++		CountAttempts:   2,
++		RefreshAttempts: 1,
++	})
++}
++
+ // Models returns a list of models supported by this handler.
+ func (h *ClaudeCodeAPIHandler) Models() []map[string]any {
+ 	// Get dynamic models from the global registry
+@@ -120,6 +135,7 @@ func (h *ClaudeCodeAPIHandler) ClaudeCountTokens(c *gin.Context) {
+ 
+ 	alt := h.GetAlt(c)
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
++	cliCtx = withClaudeCountBudget(cliCtx)
+ 
+ 	modelName := gjson.GetBytes(rawJSON, "model").String()
+ 
+@@ -209,6 +225,7 @@ func (h *ClaudeCodeAPIHandler) handleNonStreamingResponse(c *gin.Context, rawJSO
+ 	c.Header("Content-Type", "application/json")
+ 	alt := h.GetAlt(c)
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
++	cliCtx = withClaudeGenerationBudget(cliCtx)
+ 	stopKeepAlive := h.StartNonStreamingKeepAlive(c, cliCtx)
+ 
+ 	modelName := gjson.GetBytes(rawJSON, "model").String()
+@@ -273,6 +290,7 @@ func (h *ClaudeCodeAPIHandler) handleStreamingResponse(c *gin.Context, rawJSON [
+ 	// Create a cancellable context for the backend client request
+ 	// This allows proper cleanup and cancellation of ongoing requests
+ 	cliCtx, cliCancel := h.GetContextWithCancel(h, c, context.Background())
++	cliCtx = withClaudeGenerationBudget(cliCtx)
+ 
+ 	dataChan, upstreamHeaders, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, rawJSON, "")
+ 	setSSEHeaders := func() {
+diff --git a/sdk/api/handlers/handlers.go b/sdk/api/handlers/handlers.go
+index f3ab717..52c3842 100644
+--- a/sdk/api/handlers/handlers.go
++++ b/sdk/api/handlers/handlers.go
+@@ -1418,6 +1418,7 @@ func (h *BaseAPIHandler) executeStreamWithAuthManagerFormats(ctx context.Context
+ 						}
+ 					}
+ 					sentPayload = true
++					coreauth.MarkRequestBudgetCommitted(ctx)
+ 					streamHeadersCommitted = true
+ 					if okSendData := sendData(payload); !okSendData {
+ 						return
+diff --git a/sdk/cliproxy/auth/conductor.go b/sdk/cliproxy/auth/conductor.go
+index fedf495..233742c 100644
+--- a/sdk/cliproxy/auth/conductor.go
++++ b/sdk/cliproxy/auth/conductor.go
+@@ -1865,6 +1865,9 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
+ 		}
+ 		execOpts := opts
+ 		execReq, execOpts = applyRequestAfterAuthInterceptor(ctx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
++		if errBudget := consumeGenerationAttempt(ctx); errBudget != nil {
++			return nil, errBudget
++		}
+ 		streamResult, errStream := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+ 		if errStream != nil {
+ 			if errCtx := ctx.Err(); errCtx != nil {
+@@ -1873,7 +1876,12 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
+ 			if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(ctx, auth, errStream, didRefreshOnUnauthorized); okRefresh {
+ 				auth = refreshed
+ 				didRefreshOnUnauthorized = true
+-				streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
++				allowPostRefreshGeneration(ctx)
++				if errBudget := consumeGenerationAttempt(ctx); errBudget != nil {
++					errStream = errBudget
++				} else {
++					streamResult, errStream = executor.ExecuteStream(ctx, auth, execReq, execOpts)
++				}
+ 				if errStream != nil {
+ 					if errCtx := ctx.Err(); errCtx != nil {
+ 						return nil, errCtx
+@@ -1886,7 +1894,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
+ 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+ 			result.RetryAfter = retryAfterFromError(errStream)
+ 			m.MarkResult(ctx, result)
+-			if isRequestInvalidError(errStream) {
++			if isRequestInvalidError(errStream) || requestBudgetEnabled(ctx) {
+ 				return nil, errStream
+ 			}
+ 			lastErr = errStream
+@@ -1903,21 +1911,27 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
+ 				discardStreamChunks(streamResult.Chunks)
+ 				auth = refreshed
+ 				didRefreshOnUnauthorized = true
+-				retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
+-				if retryErr != nil {
+-					if errCtx := ctx.Err(); errCtx != nil {
+-						return nil, errCtx
+-					}
+-					bootstrapErr = retryErr
++				allowPostRefreshGeneration(ctx)
++				if errBudget := consumeGenerationAttempt(ctx); errBudget != nil {
++					bootstrapErr = errBudget
+ 					streamResult = &cliproxyexecutor.StreamResult{}
+ 				} else {
+-					streamResult = retryStream
+-					buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
++					retryStream, retryErr := executor.ExecuteStream(ctx, auth, execReq, execOpts)
++					if retryErr != nil {
++						if errCtx := ctx.Err(); errCtx != nil {
++							return nil, errCtx
++						}
++						bootstrapErr = retryErr
++						streamResult = &cliproxyexecutor.StreamResult{}
++					} else {
++						streamResult = retryStream
++						buffered, closed, bootstrapErr = readStreamBootstrap(ctx, streamResult.Chunks)
++					}
+ 				}
+ 			}
+ 		}
+ 		if bootstrapErr != nil {
+-			if isRequestInvalidError(bootstrapErr) {
++			if isRequestInvalidError(bootstrapErr) || requestBudgetEnabled(ctx) {
+ 				rerr := resultErrorFromError(bootstrapErr)
+ 				result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: rerr}
+ 				result.RetryAfter = retryAfterFromError(bootstrapErr)
+@@ -1946,7 +1960,7 @@ func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor Provi
+ 			emptyErr := &Error{Code: "empty_stream", Message: "upstream stream closed before first payload", Retryable: true}
+ 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: false, Error: emptyErr}
+ 			m.MarkResult(ctx, result)
+-			if idx < len(execModels)-1 {
++			if idx < len(execModels)-1 && !requestBudgetEnabled(ctx) {
+ 				lastErr = emptyErr
+ 				continue
+ 			}
+@@ -2345,6 +2359,9 @@ func (m *Manager) Execute(ctx context.Context, providers []string, req cliproxye
+ 			return resp, nil
+ 		}
+ 		lastErr = errExec
++		if requestBudgetEnabled(ctx) {
++			break
++		}
+ 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+ 		if !shouldRetry {
+ 			break
+@@ -2383,6 +2400,9 @@ func (m *Manager) ExecuteCount(ctx context.Context, providers []string, req clip
+ 			return resp, nil
+ 		}
+ 		lastErr = errExec
++		if requestBudgetEnabled(ctx) {
++			break
++		}
+ 		wait, shouldRetry := m.shouldRetryAfterError(errExec, attempt, normalized, retryModel, maxWait)
+ 		if !shouldRetry {
+ 			break
+@@ -2415,6 +2435,9 @@ func (m *Manager) ExecuteStream(ctx context.Context, providers []string, req cli
+ 			return result, nil
+ 		}
+ 		lastErr = errStream
++		if requestBudgetEnabled(ctx) {
++			break
++		}
+ 		wait, shouldRetry := m.shouldRetryAfterError(errStream, attempt, normalized, retryModel, maxWait)
+ 		if !shouldRetry {
+ 			break
+@@ -2598,6 +2621,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 			}
+ 			execOpts := opts
+ 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
++			if errBudget := consumeGenerationAttempt(execCtx); errBudget != nil {
++				return cliproxyexecutor.Response{}, errBudget
++			}
+ 			resp, errExec := executor.Execute(execCtx, auth, execReq, execOpts)
+ 			if errExec != nil {
+ 				if errCtx := execCtx.Err(); errCtx != nil {
+@@ -2606,7 +2632,12 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+ 					auth = refreshed
+ 					didRefreshOnUnauthorized = true
+-					resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
++					allowPostRefreshGeneration(execCtx)
++					if errBudget := consumeGenerationAttempt(execCtx); errBudget != nil {
++						errExec = errBudget
++					} else {
++						resp, errExec = executor.Execute(execCtx, auth, execReq, execOpts)
++					}
+ 					if errExec != nil {
+ 						if errCtx := execCtx.Err(); errCtx != nil {
+ 							return cliproxyexecutor.Response{}, errCtx
+@@ -2621,7 +2652,7 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req
+ 					result.RetryAfter = ra
+ 				}
+ 				m.MarkResult(execCtx, result)
+-				if isRequestInvalidError(errExec) {
++				if isRequestInvalidError(errExec) || requestBudgetEnabled(execCtx) {
+ 					return cliproxyexecutor.Response{}, errExec
+ 				}
+ 				authErr = errExec
+@@ -2711,6 +2742,9 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
+ 			}
+ 			execOpts := opts
+ 			execReq, execOpts = applyRequestAfterAuthInterceptor(execCtx, executor, provider, execReq, execOpts, requestedModelAliasFromOptions(execOpts, routeModel))
++			if errBudget := consumeCountAttempt(execCtx); errBudget != nil {
++				return cliproxyexecutor.Response{}, errBudget
++			}
+ 			resp, errExec := executor.CountTokens(execCtx, auth, execReq, execOpts)
+ 			if errExec != nil {
+ 				if errCtx := execCtx.Err(); errCtx != nil {
+@@ -2719,7 +2753,12 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
+ 				if refreshed, okRefresh := m.tryRefreshAfterUnauthorized(execCtx, auth, errExec, didRefreshOnUnauthorized); okRefresh {
+ 					auth = refreshed
+ 					didRefreshOnUnauthorized = true
+-					resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
++					allowPostRefreshCount(execCtx)
++					if errBudget := consumeCountAttempt(execCtx); errBudget != nil {
++						errExec = errBudget
++					} else {
++						resp, errExec = executor.CountTokens(execCtx, auth, execReq, execOpts)
++					}
+ 					if errExec != nil {
+ 						if errCtx := execCtx.Err(); errCtx != nil {
+ 							return cliproxyexecutor.Response{}, errCtx
+@@ -2734,7 +2773,7 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
+ 					result.RetryAfter = ra
+ 				}
+ 				m.MarkResult(execCtx, result)
+-				if isRequestInvalidError(errExec) {
++				if isRequestInvalidError(errExec) || requestBudgetEnabled(execCtx) {
+ 					return cliproxyexecutor.Response{}, errExec
+ 				}
+ 				authErr = errExec
+@@ -2821,7 +2860,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
+ 			if errCtx := execCtx.Err(); errCtx != nil {
+ 				return nil, errCtx
+ 			}
+-			if isRequestInvalidError(errStream) {
++			if isRequestInvalidError(errStream) || requestBudgetEnabled(execCtx) {
+ 				return nil, errStream
+ 			}
+ 			lastErr = errStream
+@@ -5932,6 +5971,10 @@ func (m *Manager) tryRefreshAfterUnauthorized(ctx context.Context, auth *Auth, e
+ 	if !isUnauthorizedError(execErr) || !authHasRefreshCredential(auth) {
+ 		return auth, false
+ 	}
++	if errBudget := consumeRefreshAttempt(ctx); errBudget != nil {
++		log.Debugf("credential refresh skipped for %s (%s): %v", auth.Provider, auth.ID, errBudget)
++		return auth, false
++	}
+ 	log.Debugf("unauthorized response for %s (%s), refreshing credentials before fallback", auth.Provider, auth.ID)
+ 	refreshed, errRefresh := m.refreshAuthForRequest(ctx, auth.ID, authAccessToken(auth))
+ 	if errRefresh != nil || refreshed == nil {
+diff --git a/sdk/cliproxy/auth/request_budget.go b/sdk/cliproxy/auth/request_budget.go
+new file mode 100644
+index 0000000..4507b7e
+--- /dev/null
++++ b/sdk/cliproxy/auth/request_budget.go
+@@ -0,0 +1,187 @@
++package auth
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"sync"
++)
++
++// RequestBudgetLimits bounds real provider actions for one inbound request.
++type RequestBudgetLimits struct {
++	GenerationAttempts int
++	CountAttempts      int
++	RefreshAttempts    int
++}
++
++// RequestBudgetSnapshot exposes counters without the request payload or credentials.
++type RequestBudgetSnapshot struct {
++	GenerationAttempts int
++	CountAttempts      int
++	RefreshAttempts    int
++	Committed          bool
++}
++
++type requestBudgetContextKey struct{}
++
++type requestAttemptBudget struct {
++	mu sync.Mutex
++
++	limits RequestBudgetLimits
++
++	generationAttempts int
++	countAttempts      int
++	refreshAttempts    int
++
++	postRefreshGeneration bool
++	postRefreshCount      bool
++	committed             bool
++}
++
++// WithRequestBudget attaches a request-scoped attempt budget to ctx.
++func WithRequestBudget(ctx context.Context, limits RequestBudgetLimits) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	if limits.GenerationAttempts < 0 {
++		limits.GenerationAttempts = 0
++	}
++	if limits.CountAttempts < 0 {
++		limits.CountAttempts = 0
++	}
++	if limits.RefreshAttempts < 0 {
++		limits.RefreshAttempts = 0
++	}
++	return context.WithValue(ctx, requestBudgetContextKey{}, &requestAttemptBudget{limits: limits})
++}
++
++// RequestBudgetSnapshotFromContext returns sanitized request-attempt counters.
++func RequestBudgetSnapshotFromContext(ctx context.Context) (RequestBudgetSnapshot, bool) {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return RequestBudgetSnapshot{}, false
++	}
++	budget.mu.Lock()
++	defer budget.mu.Unlock()
++	return RequestBudgetSnapshot{
++		GenerationAttempts: budget.generationAttempts,
++		CountAttempts:      budget.countAttempts,
++		RefreshAttempts:    budget.refreshAttempts,
++		Committed:          budget.committed,
++	}, true
++}
++
++// MarkRequestBudgetCommitted prevents any later generation replay after output is visible.
++func MarkRequestBudgetCommitted(ctx context.Context) {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return
++	}
++	budget.mu.Lock()
++	budget.committed = true
++	budget.postRefreshGeneration = false
++	budget.postRefreshCount = false
++	budget.mu.Unlock()
++}
++
++func requestBudgetFromContext(ctx context.Context) *requestAttemptBudget {
++	if ctx == nil {
++		return nil
++	}
++	budget, _ := ctx.Value(requestBudgetContextKey{}).(*requestAttemptBudget)
++	return budget
++}
++
++func requestBudgetEnabled(ctx context.Context) bool {
++	return requestBudgetFromContext(ctx) != nil
++}
++
++func consumeGenerationAttempt(ctx context.Context) error {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return nil
++	}
++	budget.mu.Lock()
++	defer budget.mu.Unlock()
++	if budget.committed {
++		return requestBudgetExceeded("generation after response commit")
++	}
++	if budget.generationAttempts == 0 && budget.limits.GenerationAttempts > 0 {
++		budget.generationAttempts++
++		return nil
++	}
++	if budget.postRefreshGeneration && budget.generationAttempts < budget.limits.GenerationAttempts {
++		budget.postRefreshGeneration = false
++		budget.generationAttempts++
++		return nil
++	}
++	return requestBudgetExceeded("generation")
++}
++
++func consumeCountAttempt(ctx context.Context) error {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return nil
++	}
++	budget.mu.Lock()
++	defer budget.mu.Unlock()
++	if budget.committed {
++		return requestBudgetExceeded("token count after response commit")
++	}
++	if budget.countAttempts == 0 && budget.limits.CountAttempts > 0 {
++		budget.countAttempts++
++		return nil
++	}
++	if budget.postRefreshCount && budget.countAttempts < budget.limits.CountAttempts {
++		budget.postRefreshCount = false
++		budget.countAttempts++
++		return nil
++	}
++	return requestBudgetExceeded("token count")
++}
++
++func consumeRefreshAttempt(ctx context.Context) error {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return nil
++	}
++	budget.mu.Lock()
++	defer budget.mu.Unlock()
++	if budget.committed || budget.refreshAttempts >= budget.limits.RefreshAttempts {
++		return requestBudgetExceeded("credential refresh")
++	}
++	budget.refreshAttempts++
++	return nil
++}
++
++func allowPostRefreshGeneration(ctx context.Context) {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return
++	}
++	budget.mu.Lock()
++	if !budget.committed {
++		budget.postRefreshGeneration = true
++	}
++	budget.mu.Unlock()
++}
++
++func allowPostRefreshCount(ctx context.Context) {
++	budget := requestBudgetFromContext(ctx)
++	if budget == nil {
++		return
++	}
++	budget.mu.Lock()
++	if !budget.committed {
++		budget.postRefreshCount = true
++	}
++	budget.mu.Unlock()
++}
++
++func requestBudgetExceeded(action string) error {
++	return &Error{
++		Code:       requestScopedErrorCode,
++		Message:    fmt.Sprintf("request attempt budget exhausted for %s", action),
++		HTTPStatus: http.StatusFailedDependency,
++	}
++}
+diff --git a/sdk/cliproxy/auth/request_budget_test.go b/sdk/cliproxy/auth/request_budget_test.go
+new file mode 100644
+index 0000000..00a2f1d
+--- /dev/null
++++ b/sdk/cliproxy/auth/request_budget_test.go
+@@ -0,0 +1,197 @@
++package auth
++
++import (
++	"context"
++	"net/http"
++	"testing"
++
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++)
++
++func TestRequestBudgetAllowsOnlyRefreshAuthorizedGenerationReplay(t *testing.T) {
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{
++		GenerationAttempts: 2,
++		RefreshAttempts:    1,
++	})
++
++	if err := consumeGenerationAttempt(ctx); err != nil {
++		t.Fatalf("initial generation attempt failed: %v", err)
++	}
++	if err := consumeGenerationAttempt(ctx); err == nil {
++		t.Fatal("generation replay succeeded without an authorized refresh")
++	}
++	if err := consumeRefreshAttempt(ctx); err != nil {
++		t.Fatalf("refresh attempt failed: %v", err)
++	}
++	allowPostRefreshGeneration(ctx)
++	if err := consumeGenerationAttempt(ctx); err != nil {
++		t.Fatalf("post-refresh generation attempt failed: %v", err)
++	}
++	if err := consumeGenerationAttempt(ctx); err == nil {
++		t.Fatal("third generation attempt exceeded the budget but succeeded")
++	}
++
++	snapshot, ok := RequestBudgetSnapshotFromContext(ctx)
++	if !ok {
++		t.Fatal("request budget snapshot was unavailable")
++	}
++	if snapshot.GenerationAttempts != 2 || snapshot.RefreshAttempts != 1 {
++		t.Fatalf("unexpected request budget snapshot: %#v", snapshot)
++	}
++}
++
++func TestRequestBudgetCommitPreventsPostRefreshReplay(t *testing.T) {
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{
++		GenerationAttempts: 2,
++		RefreshAttempts:    1,
++	})
++	if err := consumeGenerationAttempt(ctx); err != nil {
++		t.Fatalf("initial generation attempt failed: %v", err)
++	}
++	if err := consumeRefreshAttempt(ctx); err != nil {
++		t.Fatalf("refresh attempt failed: %v", err)
++	}
++	allowPostRefreshGeneration(ctx)
++	MarkRequestBudgetCommitted(ctx)
++	if err := consumeGenerationAttempt(ctx); err == nil {
++		t.Fatal("generation replay succeeded after output was committed")
++	}
++
++	snapshot, ok := RequestBudgetSnapshotFromContext(ctx)
++	if !ok || !snapshot.Committed {
++		t.Fatalf("request budget did not record response commit: %#v", snapshot)
++	}
++}
++
++func TestRequestBudgetSeparatesCountAttempts(t *testing.T) {
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{
++		CountAttempts:   2,
++		RefreshAttempts: 1,
++	})
++	if err := consumeCountAttempt(ctx); err != nil {
++		t.Fatalf("initial count attempt failed: %v", err)
++	}
++	if err := consumeCountAttempt(ctx); err == nil {
++		t.Fatal("count replay succeeded without a refresh")
++	}
++	if err := consumeRefreshAttempt(ctx); err != nil {
++		t.Fatalf("refresh attempt failed: %v", err)
++	}
++	allowPostRefreshCount(ctx)
++	if err := consumeCountAttempt(ctx); err != nil {
++		t.Fatalf("post-refresh count attempt failed: %v", err)
++	}
++}
++
++func TestManagerRequestBudgetStopsCrossCredentialAttempts(t *testing.T) {
++	request := cliproxyexecutor.Request{Model: "test-model"}
++	testCases := []struct {
++		name   string
++		limits RequestBudgetLimits
++		invoke func(context.Context, *Manager) error
++	}{
++		{
++			name:   "execute",
++			limits: RequestBudgetLimits{GenerationAttempts: 2, RefreshAttempts: 1},
++			invoke: func(ctx context.Context, manager *Manager) error {
++				_, err := manager.Execute(ctx, []string{"claude"}, request, cliproxyexecutor.Options{})
++				return err
++			},
++		},
++		{
++			name:   "execute_stream",
++			limits: RequestBudgetLimits{GenerationAttempts: 2, RefreshAttempts: 1},
++			invoke: func(ctx context.Context, manager *Manager) error {
++				_, err := manager.ExecuteStream(ctx, []string{"claude"}, request, cliproxyexecutor.Options{})
++				return err
++			},
++		},
++		{
++			name:   "count_tokens",
++			limits: RequestBudgetLimits{CountAttempts: 2, RefreshAttempts: 1},
++			invoke: func(ctx context.Context, manager *Manager) error {
++				_, err := manager.ExecuteCount(ctx, []string{"claude"}, request, cliproxyexecutor.Options{})
++				return err
++			},
++		},
++	}
++
++	for _, testCase := range testCases {
++		t.Run(testCase.name, func(t *testing.T) {
++			manager, executor := newCredentialRetryLimitTestManager(t, 0)
++			ctx := WithRequestBudget(context.Background(), testCase.limits)
++			if err := testCase.invoke(ctx, manager); err == nil {
++				t.Fatal("expected provider error")
++			} else if statusCodeFromError(err) != http.StatusInternalServerError {
++				t.Fatalf("provider status = %d, want 500: %v", statusCodeFromError(err), err)
++			}
++			if calls := executor.Calls(); calls != 1 {
++				t.Fatalf("provider calls = %d, want 1", calls)
++			}
++		})
++	}
++}
++
++func TestManagerRequestBudgetAllowsOneSuccessfulUnauthorizedRefreshReplay(t *testing.T) {
++	manager, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, false)
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{
++		GenerationAttempts: 2,
++		RefreshAttempts:    1,
++	})
++
++	response, err := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
++	if err != nil {
++		t.Fatalf("Execute error = %v, want successful refresh replay", err)
++	}
++	if got := string(response.Payload); got != primary.ID+":fresh-access-token" {
++		t.Fatalf("payload = %q, want refreshed primary response", got)
++	}
++	if calls := executor.ExecuteCalls(); len(calls) != 2 || calls[0] != primary.ID || calls[1] != primary.ID {
++		t.Fatalf("Execute calls = %v, want [primary, primary]", calls)
++	}
++	if executor.RefreshCalls() != 1 {
++		t.Fatalf("Refresh calls = %d, want 1", executor.RefreshCalls())
++	}
++	for _, id := range executor.ExecuteCalls() {
++		if id == backup.ID {
++			t.Fatal("backup credential bypassed the request budget")
++		}
++	}
++}
++
++func TestManagerRequestBudgetBlocksFallbackAfterRefreshFailure(t *testing.T) {
++	manager, executor, primary, backup, model := newUnauthorizedRefreshFixture(t, true)
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{
++		GenerationAttempts: 2,
++		RefreshAttempts:    1,
++	})
++
++	_, err := manager.Execute(ctx, []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
++	if err == nil || statusCodeFromError(err) != http.StatusUnauthorized {
++		t.Fatalf("Execute error = %v, want original 401 after failed refresh", err)
++	}
++	if calls := executor.ExecuteCalls(); len(calls) != 1 || calls[0] != primary.ID {
++		t.Fatalf("Execute calls = %v, want only primary", calls)
++	}
++	if executor.RefreshCalls() != 1 {
++		t.Fatalf("Refresh calls = %d, want 1", executor.RefreshCalls())
++	}
++	for _, id := range executor.ExecuteCalls() {
++		if id == backup.ID {
++			t.Fatal("backup credential bypassed the request budget")
++		}
++	}
++}
++
++func TestRequestBudgetAbsentPreservesExistingExecution(t *testing.T) {
++	ctx := context.Background()
++	if err := consumeGenerationAttempt(ctx); err != nil {
++		t.Fatalf("generation attempt without a budget failed: %v", err)
++	}
++	if err := consumeCountAttempt(ctx); err != nil {
++		t.Fatalf("count attempt without a budget failed: %v", err)
++	}
++	if err := consumeRefreshAttempt(ctx); err != nil {
++		t.Fatalf("refresh attempt without a budget failed: %v", err)
++	}
++}

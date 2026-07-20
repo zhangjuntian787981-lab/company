@@ -1,0 +1,23 @@
+{
+  "schema_version": 1,
+  "persist_allowed": [
+    "status",
+    "counts",
+    "durations",
+    "field names after sensitive-name filtering",
+    "SHA-256 digests",
+    "payload byte lengths",
+    "JSON shape"
+  ],
+  "persist_forbidden": [
+    "credential header values",
+    "OAuth field values",
+    "API key values",
+    "raw request headers",
+    "raw request body",
+    "raw response headers",
+    "raw response body",
+    "known canary strings"
+  ],
+  "failure_behavior": "block report completion"
+}

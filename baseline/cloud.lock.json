@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "mode": "absent",
+  "production": {
+    "host": "127.0.0.1",
+    "port": 8317
+  },
+  "files": []
+}

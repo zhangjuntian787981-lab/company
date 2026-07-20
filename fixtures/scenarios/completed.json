@@ -1,0 +1,7 @@
+{
+  "name": "completed",
+  "status": 200,
+  "sse_events": [
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "resp_completed", "status": "completed"}}}
+  ]
+}

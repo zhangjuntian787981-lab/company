@@ -1,0 +1,11 @@
+{
+  "name": "oauth_refresh",
+  "status": 200,
+  "json": {
+    "access_token": "compat-synthetic-access-token",
+    "refresh_token": "compat-synthetic-refresh-token",
+    "token_type": "Bearer",
+    "expires_in": 3600,
+    "scope": "compat.synthetic"
+  }
+}

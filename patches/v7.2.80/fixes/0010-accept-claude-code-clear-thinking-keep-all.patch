@@ -1,0 +1,91 @@
+diff --git a/sdk/api/handlers/claude/context_management.go b/sdk/api/handlers/claude/context_management.go
+--- a/sdk/api/handlers/claude/context_management.go
++++ b/sdk/api/handlers/claude/context_management.go
+@@ -33,10 +33,24 @@ func applyClaudeContextManagement(root map[string]any) error {
+ 		return newClaudeRequestPolicyError("$.context_management.edits", "must contain one supported edit")
+ 	}
+ 	edit, ok := edits[0].(map[string]any)
+-	if !ok || len(edit) != 1 {
+-		return newClaudeRequestPolicyError("$.context_management.edits[0]", "must contain only type")
++	if !ok {
++		return newClaudeRequestPolicyError("$.context_management.edits[0]", "must be an object")
+ 	}
+-	if edit["type"] != "clear_tool_uses_20250919" {
++	switch edit["type"] {
++	case "clear_thinking_20251015":
++		if len(edit) != 2 {
++			return newClaudeRequestPolicyError("$.context_management.edits[0]", "clear_thinking must contain only type and keep")
++		}
++		if edit["keep"] != "all" {
++			return newClaudeRequestPolicyError("$.context_management.edits[0].keep", "clear_thinking only supports all")
++		}
++		delete(root, "context_management")
++		return nil
++	case "clear_tool_uses_20250919":
++		if len(edit) != 1 {
++			return newClaudeRequestPolicyError("$.context_management.edits[0]", "clear_tool_uses must contain only type")
++		}
++	default:
+ 		return newClaudeRequestPolicyError("$.context_management.edits[0].type", "unsupported context edit")
+ 	}
+ 
+diff --git a/sdk/api/handlers/claude/context_management_test.go b/sdk/api/handlers/claude/context_management_test.go
+--- a/sdk/api/handlers/claude/context_management_test.go
++++ b/sdk/api/handlers/claude/context_management_test.go
+@@ -42,6 +42,9 @@ func TestClaudeContextManagementRejectsUnknownOrParameterizedEdits(t *testing.T)
+ 	tests := []string{
+ 		`{"type":"unknown"}`,
+ 		`{"type":"clear_tool_uses_20250919","keep":1}`,
++		`{"type":"clear_thinking_20251015"}`,
++		`{"type":"clear_thinking_20251015","keep":"none"}`,
++		`{"type":"clear_thinking_20251015","keep":"all","extra":true}`,
+ 	}
+ 	for _, edit := range tests {
+ 		body := []byte(`{"model":"test","max_tokens":64,"context_management":{"edits":[` + edit + `]},"messages":[]}`)
+@@ -52,6 +55,24 @@ func TestClaudeContextManagementRejectsUnknownOrParameterizedEdits(t *testing.T)
+ 	}
+ }
+ 
++func TestClaudeContextManagementAcceptsClaudeCodeClearThinking(t *testing.T) {
++	policy, err := preflightClaudeRequest([]byte(`{
++		"model":"test",
++		"max_tokens":64,
++		"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"all"}]},
++		"messages":[{"role":"user","content":"current"}]
++	}`))
++	if err != nil {
++		t.Fatalf("preflight: %v", err)
++	}
++	if gjson.GetBytes(policy.rawJSON, "context_management").Exists() {
++		t.Fatalf("context_management reached upstream: %s", policy.rawJSON)
++	}
++	if got := gjson.GetBytes(policy.rawJSON, "messages.0.content").String(); got != "current" {
++		t.Fatalf("message content = %q, want current", got)
++	}
++}
++
+ func TestClaudeContextManagementPreservesUnclosedToolBlocks(t *testing.T) {
+ 	tests := []struct {
+ 		name     string
+diff --git a/sdk/api/handlers/claude/request_policy_test.go b/sdk/api/handlers/claude/request_policy_test.go
+--- a/sdk/api/handlers/claude/request_policy_test.go
++++ b/sdk/api/handlers/claude/request_policy_test.go
+@@ -213,6 +213,18 @@ func TestClaudeHandlersRejectPolicyBeforeExecution(t *testing.T) {
+ 			call: handler.ClaudeMessages,
+ 		},
+ 		{
++			name: "messages invalid clear thinking",
++			path: "/v1/messages",
++			body: `{"model":"test","max_tokens":64,"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"none"}]},"messages":[]}`,
++			call: handler.ClaudeMessages,
++		},
++		{
++			name: "count tokens invalid clear thinking",
++			path: "/v1/messages/count_tokens",
++			body: `{"model":"test","max_tokens":64,"context_management":{"edits":[{"type":"clear_thinking_20251015","keep":"none"}]},"messages":[]}`,
++			call: handler.ClaudeCountTokens,
++		},
++		{
+ 			name: "unsafe strict schema",
+ 			path: "/v1/messages",
+ 			body: `{"model":"test","max_tokens":64,"tools":[{"name":"lookup","strict":true,"input_schema":{"type":"object","properties":{},"additionalProperties":true}}],"messages":[]}`,

@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "suite": "default-local-self-check",
+  "real_network": false,
+  "production_port": false,
+  "cases": [
+    "mock-health",
+    "text-json",
+    "text-sse",
+    "single-tool",
+    "parallel-interleaved-tools",
+    "terminal-completed",
+    "terminal-incomplete",
+    "terminal-failed",
+    "http-500",
+    "http-502",
+    "http-429",
+    "stream-disconnect",
+    "bounded-delay",
+    "synthetic-oauth-refresh",
+    "redaction-canary",
+    "cliproxyapi-bottle-local"
+  ]
+}

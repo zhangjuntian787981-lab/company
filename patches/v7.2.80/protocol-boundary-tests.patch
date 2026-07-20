@@ -1,0 +1,307 @@
+diff --git a/internal/runtime/executor/compat_protocol_boundary_test.go b/internal/runtime/executor/compat_protocol_boundary_test.go
+new file mode 100644
+index 0000000..500651f
+--- /dev/null
++++ b/internal/runtime/executor/compat_protocol_boundary_test.go
+@@ -0,0 +1,140 @@
++package executor
++
++import (
++	"bytes"
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
++	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
++)
++
++func TestCompatCodexExecutorResponseFailedOnlyIsError(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
++			terminalErr, _ := runCompatCodexTerminalCase(t, stream, func(w http.ResponseWriter, _ *http.Request) {
++				w.Header().Set("Content-Type", "text/event-stream")
++				_, _ = w.Write([]byte(`data: {"type":"response.failed","response":{"id":"resp_1","status":"failed","error":{"type":"upstream_error","code":"generation_failed","message":"generation failed"}}}` + "\n\n"))
++			})
++			if terminalErr == nil {
++				t.Fatal("response.failed was reported as successful")
++			}
++			assertNotRequestScopedTestError(t, terminalErr)
++		})
++	}
++}
++
++func TestCompatCodexExecutorMissingTerminalAfterPartialOutputIsError(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
++			terminalErr, sawPayload := runCompatCodexTerminalCase(t, stream, func(w http.ResponseWriter, _ *http.Request) {
++				w.Header().Set("Content-Type", "text/event-stream")
++				_, _ = w.Write([]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5.6-sol"}}` + "\n\n"))
++				_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","item":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"partial"}]},"output_index":0}` + "\n\n"))
++			})
++			if terminalErr == nil {
++				t.Fatal("stream without terminal event was reported as successful")
++			}
++			if got := statusCodeFromTestError(t, terminalErr); got != http.StatusRequestTimeout {
++				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusRequestTimeout, terminalErr)
++			}
++			assertRequestScopedTestError(t, terminalErr)
++			if stream && !sawPayload {
++				t.Fatal("test setup expected partial downstream payload before terminal error")
++			}
++		})
++	}
++}
++
++func TestCompatCodexExecutorFirstByteThenTransportBreakIsError(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
++			ctx := context.WithValue(context.Background(), "cliproxy.roundtripper", roundTripperFunc(func(req *http.Request) (*http.Response, error) {
++				return &http.Response{
++					StatusCode: http.StatusOK,
++					Header:     http.Header{"Content-Type": {"text/event-stream"}},
++					Body:       io.NopCloser(io.MultiReader(bytes.NewReader([]byte("d")), unexpectedEOFReader{})),
++					Request:    req,
++				}, nil
++			}))
++
++			executor := NewCodexExecutor(&config.Config{})
++			auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": "http://codex.test", "api_key": "test"}}
++			req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`)}
++			opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Stream: stream}
++
++			var terminalErr error
++			if stream {
++				result, err := executor.ExecuteStream(ctx, auth, req, opts)
++				if err != nil {
++					t.Fatalf("ExecuteStream error: %v", err)
++				}
++				for chunk := range result.Chunks {
++					if chunk.Err != nil {
++						terminalErr = chunk.Err
++					}
++				}
++			} else {
++				_, terminalErr = executor.Execute(ctx, auth, req, opts)
++			}
++			if terminalErr == nil {
++				t.Fatal("transport break after first byte was reported as successful")
++			}
++			if got := statusCodeFromTestError(t, terminalErr); got != http.StatusRequestTimeout {
++				t.Fatalf("status code = %d, want %d; err=%v", got, http.StatusRequestTimeout, terminalErr)
++			}
++			assertRequestScopedTestError(t, terminalErr)
++		})
++	}
++}
++
++func TestCompatCodexExecutorIncompleteMaxTokensIsSuccessful(t *testing.T) {
++	for _, stream := range []bool{false, true} {
++		t.Run(map[bool]string{false: "nonstream", true: "stream"}[stream], func(t *testing.T) {
++			terminalErr, _ := runCompatCodexTerminalCase(t, stream, func(w http.ResponseWriter, _ *http.Request) {
++				w.Header().Set("Content-Type", "text/event-stream")
++				_, _ = w.Write([]byte(`data: {"type":"response.incomplete","response":{"id":"resp_1","model":"gpt-5.6-sol","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"output":[],"usage":{"input_tokens":10,"output_tokens":5,"total_tokens":15}}}` + "\n\n"))
++			})
++			if terminalErr != nil {
++				t.Fatalf("response.incomplete with max_output_tokens should translate to a successful truncated Claude response: %v", terminalErr)
++			}
++		})
++	}
++}
++
++func runCompatCodexTerminalCase(t *testing.T, stream bool, handler http.HandlerFunc) (error, bool) {
++	t.Helper()
++	server := httptest.NewServer(handler)
++	defer server.Close()
++
++	executor := NewCodexExecutor(&config.Config{})
++	auth := &cliproxyauth.Auth{Attributes: map[string]string{"base_url": server.URL, "api_key": "test"}}
++	req := cliproxyexecutor.Request{Model: "gpt-5.6-sol", Payload: []byte(`{"model":"gpt-5.6-sol","messages":[{"role":"user","content":"hello"}]}`)}
++	opts := cliproxyexecutor.Options{SourceFormat: sdktranslator.FromString("claude"), Stream: stream}
++
++	if !stream {
++		_, err := executor.Execute(context.Background(), auth, req, opts)
++		return err, false
++	}
++
++	result, err := executor.ExecuteStream(context.Background(), auth, req, opts)
++	if err != nil {
++		t.Fatalf("ExecuteStream error: %v", err)
++	}
++	var terminalErr error
++	sawPayload := false
++	for chunk := range result.Chunks {
++		if len(chunk.Payload) > 0 {
++			sawPayload = true
++		}
++		if chunk.Err != nil {
++			terminalErr = chunk.Err
++		}
++	}
++	return terminalErr, sawPayload
++}
+diff --git a/internal/translator/codex/claude/compat_protocol_boundary_test.go b/internal/translator/codex/claude/compat_protocol_boundary_test.go
+new file mode 100644
+index 0000000..55d36f1
+--- /dev/null
++++ b/internal/translator/codex/claude/compat_protocol_boundary_test.go
+@@ -0,0 +1,155 @@
++package claude
++
++import (
++	"context"
++	"strings"
++	"testing"
++
++	"github.com/tidwall/gjson"
++)
++
++func TestCompatInterleavedToolArgumentDeltasAreIsolatedByCallID(t *testing.T) {
++	ctx := context.Background()
++	originalRequest := []byte(`{"tools":[{"name":"lookup","description":"lookup","input_schema":{"type":"object","properties":{}}}]}`)
++	var param any
++
++	chunks := [][]byte{
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a"}}`),
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b"}}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"{\"a\":"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_b","delta":"{\"b\":"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"1}"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_b","delta":"2}"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.done","call_id":"call_a","arguments":"{\"a\":1}"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.done","call_id":"call_b","arguments":"{\"b\":2}"}`),
++		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{\"a\":1}"}}`),
++		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"lookup","arguments":"{\"b\":2}"}}`),
++	}
++
++	var outputs [][]byte
++	for _, chunk := range chunks {
++		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param)...)
++	}
++
++	callByIndex := map[int64]string{}
++	argsByIndex := map[int64]string{}
++	for _, out := range outputs {
++		for _, line := range strings.Split(string(out), "\n") {
++			if !strings.HasPrefix(line, "data: ") {
++				continue
++			}
++			data := gjson.Parse(strings.TrimPrefix(line, "data: "))
++			switch data.Get("type").String() {
++			case "content_block_start":
++				if data.Get("content_block.type").String() == "tool_use" {
++					callByIndex[data.Get("index").Int()] = data.Get("content_block.id").String()
++				}
++			case "content_block_delta":
++				if data.Get("delta.type").String() == "input_json_delta" {
++					idx := data.Get("index").Int()
++					argsByIndex[idx] += data.Get("delta.partial_json").String()
++				}
++			}
++		}
++	}
++
++	argsByCall := map[string]string{}
++	for idx, callID := range callByIndex {
++		argsByCall[callID] = argsByIndex[idx]
++	}
++	if got := argsByCall["call_a"]; got != `{"a":1}` {
++		t.Fatalf("call_a arguments = %q, want %q; outputs=%q", got, `{"a":1}`, outputs)
++	}
++	if got := argsByCall["call_b"]; got != `{"b":2}` {
++		t.Fatalf("call_b arguments = %q, want %q; interleaved deltas crossed call IDs; outputs=%q", got, `{"b":2}`, outputs)
++	}
++}
++
++func TestCompatClaudeRequestProtocolMapping(t *testing.T) {
++	input := []byte(`{
++		"model":"claude-opus-4-8",
++		"max_tokens":321,
++		"stop_sequences":["END"],
++		"context_management":{"edits":[{"type":"clear_tool_uses_20250919"}]},
++		"tools":[{
++			"name":"lookup",
++			"description":"lookup",
++			"strict":true,
++			"defer_loading":true,
++			"input_schema":{"type":"object","properties":{"id":{"type":"integer"}},"required":["id"],"additionalProperties":false}
++		}],
++		"messages":[{"role":"user","content":[
++			{"type":"document","source":{"type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQ="}},
++			{"type":"text","text":"summarize"}
++		]}]
++	}`)
++
++	out := ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false)
++	parsed := gjson.ParseBytes(out)
++
++	for _, path := range []string{"max_tokens", "stop", "stop_sequences", "context_management", "tools.0.defer_loading"} {
++		if parsed.Get(path).Exists() {
++			t.Errorf("%s unexpectedly survived translation: %s", path, out)
++		}
++	}
++	if got := parsed.Get("max_output_tokens").Int(); got != 321 {
++		t.Errorf("max_output_tokens = %d, want 321: %s", got, out)
++	}
++	if got := parsed.Get("tools.0.strict").Bool(); !got {
++		t.Errorf("tools.0.strict = false, want true: %s", out)
++	}
++	if file := parsed.Get("input.0.content.0"); file.Get("type").String() != "input_file" || file.Get("file_data").String() != "JVBERi0xLjQ=" || file.Get("filename").String() != "document.pdf" || parsed.Get("input.0.content.1.text").String() != "summarize" {
++		t.Errorf("document mapping was not preserved: %s", out)
++	}
++}
++
++func TestCompatClaudeAdaptiveEffortTranslation(t *testing.T) {
++	tests := []struct {
++		name       string
++		thinking   string
++		wantEffort string
++	}{
++		{name: "No thinking defaults medium", wantEffort: "medium"},
++		{name: "Adaptive omitted effort defaults xhigh", thinking: `,"thinking":{"type":"adaptive"}`, wantEffort: "xhigh"},
++		{name: "Adaptive low", thinking: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}`, wantEffort: "low"},
++		{name: "Adaptive medium", thinking: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"medium"}`, wantEffort: "medium"},
++		{name: "Adaptive high", thinking: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"high"}`, wantEffort: "high"},
++		{name: "Adaptive xhigh", thinking: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"xhigh"}`, wantEffort: "xhigh"},
++		{name: "Adaptive max", thinking: `,"thinking":{"type":"adaptive"},"output_config":{"effort":"max"}`, wantEffort: "max"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.name, func(t *testing.T) {
++			input := []byte(`{"messages":[{"role":"user","content":"hello"}]` + tc.thinking + `}`)
++			out := ConvertClaudeRequestToCodex("gpt-5.6-sol", input, false)
++			if got := gjson.GetBytes(out, "reasoning.effort").String(); got != tc.wantEffort {
++				t.Fatalf("reasoning.effort = %q, want %q; output=%s", got, tc.wantEffort, out)
++			}
++		})
++	}
++}
++
++func TestCompatStopReasonTranslation(t *testing.T) {
++	tests := []struct {
++		upstream string
++		want     string
++	}{
++		{upstream: "stop", want: "end_turn"},
++		{upstream: "max_tokens", want: "max_tokens"},
++		{upstream: "max_output_tokens", want: "max_tokens"},
++		{upstream: "stop_sequence", want: "stop_sequence"},
++		{upstream: "pause_turn", want: "pause_turn"},
++		{upstream: "refusal", want: "refusal"},
++		{upstream: "content_filter", want: "refusal"},
++		{upstream: "model_context_window_exceeded", want: "model_context_window_exceeded"},
++		{upstream: "unknown_future_reason", want: "end_turn"},
++	}
++
++	for _, tc := range tests {
++		t.Run(tc.upstream, func(t *testing.T) {
++			if got := mapCodexStopReasonToClaude(tc.upstream, false); got != tc.want {
++				t.Fatalf("stop reason %q maps to %q, want %q", tc.upstream, got, tc.want)
++			}
++		})
++	}
++}

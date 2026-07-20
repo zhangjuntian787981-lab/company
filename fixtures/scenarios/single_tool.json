@@ -1,0 +1,13 @@
+{
+  "name": "single_tool",
+  "status": 200,
+  "sse_events": [
+    {"event": "response.created", "data": {"type": "response.created", "response": {"id": "resp_tool", "object": "response", "status": "in_progress", "model": "single_tool", "output": []}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 0, "item": {"id": "call_one", "call_id": "call_one", "type": "function_call", "status": "in_progress", "name": "compat.echo", "arguments": ""}}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_one", "call_id": "call_one", "output_index": 0, "delta": "{\"value\":"}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_one", "call_id": "call_one", "output_index": 0, "delta": "\"alpha\"}"}},
+    {"event": "response.function_call_arguments.done", "data": {"type": "response.function_call_arguments.done", "item_id": "call_one", "call_id": "call_one", "output_index": 0, "arguments": "{\"value\":\"alpha\"}"}},
+    {"event": "response.output_item.done", "data": {"type": "response.output_item.done", "output_index": 0, "item": {"id": "call_one", "call_id": "call_one", "type": "function_call", "status": "completed", "name": "compat.echo", "arguments": "{\"value\":\"alpha\"}"}}},
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "resp_tool", "object": "response", "status": "completed", "model": "single_tool", "output": [{"id": "call_one", "call_id": "call_one", "type": "function_call", "status": "completed", "name": "compat.echo", "arguments": "{\"value\":\"alpha\"}"}], "usage": {"input_tokens": 8, "output_tokens": 4, "total_tokens": 12}}}}
+  ]
+}

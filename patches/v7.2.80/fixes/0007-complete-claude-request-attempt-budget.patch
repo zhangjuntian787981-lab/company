@@ -1,0 +1,66 @@
+diff --git a/internal/runtime/executor/claude_executor.go b/internal/runtime/executor/claude_executor.go
+index b3e348a..e683703 100644
+--- a/internal/runtime/executor/claude_executor.go
++++ b/internal/runtime/executor/claude_executor.go
+@@ -825,7 +825,7 @@ func (e *ClaudeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (
+ 		return auth, nil
+ 	}
+ 	svc := claudeauth.NewClaudeAuthWithProxyURL(e.cfg, auth.ProxyURL)
+-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
++	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, cliproxyauth.RequestBudgetRefreshAttemptLimit(ctx, 3))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/internal/runtime/executor/codex_executor.go b/internal/runtime/executor/codex_executor.go
+index c4922be..a605b06 100644
+--- a/internal/runtime/executor/codex_executor.go
++++ b/internal/runtime/executor/codex_executor.go
+@@ -1469,7 +1469,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
+ 		return auth, nil
+ 	}
+ 	svc := codexauth.NewCodexAuthWithProxyURL(e.cfg, auth.ProxyURL)
+-	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
++	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, cliproxyauth.RequestBudgetRefreshAttemptLimit(ctx, 3))
+ 	if err != nil {
+ 		return nil, err
+ 	}
+diff --git a/sdk/cliproxy/auth/request_budget.go b/sdk/cliproxy/auth/request_budget.go
+index 4507b7e..8c69b2d 100644
+--- a/sdk/cliproxy/auth/request_budget.go
++++ b/sdk/cliproxy/auth/request_budget.go
+@@ -71,6 +71,17 @@ func RequestBudgetSnapshotFromContext(ctx context.Context) (RequestBudgetSnapsho
+ 	}, true
+ }
+ 
++// RequestBudgetRefreshAttemptLimit returns one real token-endpoint attempt when a request budget is active.
++func RequestBudgetRefreshAttemptLimit(ctx context.Context, fallback int) int {
++	if fallback < 1 {
++		fallback = 1
++	}
++	if requestBudgetFromContext(ctx) != nil {
++		return 1
++	}
++	return fallback
++}
++
+ // MarkRequestBudgetCommitted prevents any later generation replay after output is visible.
+ func MarkRequestBudgetCommitted(ctx context.Context) {
+ 	budget := requestBudgetFromContext(ctx)
+diff --git a/sdk/cliproxy/auth/request_budget_test.go b/sdk/cliproxy/auth/request_budget_test.go
+index 00a2f1d..b6014ba 100644
+--- a/sdk/cliproxy/auth/request_budget_test.go
++++ b/sdk/cliproxy/auth/request_budget_test.go
+@@ -195,3 +195,13 @@ func TestRequestBudgetAbsentPreservesExistingExecution(t *testing.T) {
+ 		t.Fatalf("refresh attempt without a budget failed: %v", err)
+ 	}
+ }
++
++func TestRequestBudgetRefreshAttemptLimit(t *testing.T) {
++	if got := RequestBudgetRefreshAttemptLimit(context.Background(), 3); got != 3 {
++		t.Fatalf("unbudgeted refresh attempt limit = %d, want 3", got)
++	}
++	ctx := WithRequestBudget(context.Background(), RequestBudgetLimits{RefreshAttempts: 1})
++	if got := RequestBudgetRefreshAttemptLimit(ctx, 3); got != 1 {
++		t.Fatalf("budgeted refresh attempt limit = %d, want 1", got)
++	}
++}

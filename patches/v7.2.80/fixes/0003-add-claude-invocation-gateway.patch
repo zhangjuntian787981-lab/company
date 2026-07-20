@@ -1,0 +1,838 @@
+diff --git a/cmd/claude-budget-gateway/main.go b/cmd/claude-budget-gateway/main.go
+new file mode 100644
+index 0000000..dbd8bf3
+--- /dev/null
++++ b/cmd/claude-budget-gateway/main.go
+@@ -0,0 +1,122 @@
++package main
++
++import (
++	"context"
++	"encoding/json"
++	"flag"
++	"fmt"
++	"net"
++	"net/http"
++	"os"
++	"os/signal"
++	"path/filepath"
++	"syscall"
++	"time"
++
++	"github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway"
++)
++
++func main() {
++	os.Exit(run())
++}
++
++func run() int {
++	var (
++		targetRaw       string
++		listenAddress   string
++		readyFile       string
++		connectTimeout  time.Duration
++		maxRequestBytes int64
++		maxReplayBytes  int64
++	)
++	flag.StringVar(&targetRaw, "target", "", "loopback CLIProxyAPI base URL")
++	flag.StringVar(&listenAddress, "listen", "127.0.0.1:0", "loopback listen address")
++	flag.StringVar(&readyFile, "ready-file", "", "optional private JSON readiness file")
++	flag.DurationVar(&connectTimeout, "connect-timeout", 30*time.Second, "upstream connection timeout")
++	flag.Int64Var(&maxRequestBytes, "max-request-bytes", 64<<20, "maximum inbound request body size")
++	flag.Int64Var(&maxReplayBytes, "max-replay-bytes", 64<<20, "maximum in-memory replay response size")
++	flag.Parse()
++
++	target, err := claudegateway.ParseTarget(targetRaw)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return 2
++	}
++	gateway, err := claudegateway.New(claudegateway.Config{
++		Target:              target,
++		MaxRequestBodyBytes: maxRequestBytes,
++		MaxReplayBytes:      maxReplayBytes,
++		ConnectTimeout:      connectTimeout,
++	})
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return 2
++	}
++
++	listener, err := net.Listen("tcp", listenAddress)
++	if err != nil {
++		fmt.Fprintln(os.Stderr, err)
++		return 1
++	}
++	defer listener.Close()
++	if !isLoopbackListener(listener.Addr()) {
++		fmt.Fprintln(os.Stderr, "gateway listener must be loopback")
++		return 2
++	}
++
++	if readyFile != "" {
++		if err = writeReadyFile(readyFile, listener.Addr().String()); err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			return 1
++		}
++	}
++	fmt.Printf("http://%s\n", listener.Addr().String())
++
++	server := &http.Server{
++		Handler:           gateway,
++		ReadHeaderTimeout: 10 * time.Second,
++	}
++	serveErr := make(chan error, 1)
++	go func() {
++		serveErr <- server.Serve(listener)
++	}()
++
++	signalCtx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
++	defer stop()
++	select {
++	case <-signalCtx.Done():
++		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
++		defer cancel()
++		if err = server.Shutdown(shutdownCtx); err != nil {
++			fmt.Fprintln(os.Stderr, err)
++			return 1
++		}
++		return 0
++	case err = <-serveErr:
++		if err == nil || err == http.ErrServerClosed {
++			return 0
++		}
++		fmt.Fprintln(os.Stderr, err)
++		return 1
++	}
++}
++
++func isLoopbackListener(address net.Addr) bool {
++	tcpAddress, ok := address.(*net.TCPAddr)
++	return ok && tcpAddress.IP.IsLoopback()
++}
++
++func writeReadyFile(path, address string) error {
++	parent := filepath.Dir(path)
++	if info, err := os.Stat(parent); err != nil || !info.IsDir() {
++		return fmt.Errorf("ready-file parent is unavailable")
++	}
++	payload, err := json.Marshal(map[string]string{"base_url": "http://" + address})
++	if err != nil {
++		return err
++	}
++	if err = os.WriteFile(path, append(payload, '\n'), 0o600); err != nil {
++		return fmt.Errorf("write ready file: %w", err)
++	}
++	return os.Chmod(path, 0o600)
++}
+diff --git a/internal/claudegateway/gateway.go b/internal/claudegateway/gateway.go
+new file mode 100644
+index 0000000..a1e36fa
+--- /dev/null
++++ b/internal/claudegateway/gateway.go
+@@ -0,0 +1,409 @@
++// Package claudegateway provides a loopback-only retry budget boundary for Claude Code.
++package claudegateway
++
++import (
++	"bufio"
++	"bytes"
++	"crypto/sha256"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"net"
++	"net/http"
++	"net/url"
++	"strconv"
++	"strings"
++	"sync"
++	"time"
++)
++
++const productionPort = 8317
++
++// Config controls one invocation-scoped gateway.
++type Config struct {
++	Target              *url.URL
++	MaxRequestBodyBytes int64
++	MaxReplayBytes      int64
++	ConnectTimeout      time.Duration
++}
++
++// Gateway forwards each distinct request at most once to its target.
++type Gateway struct {
++	target          *url.URL
++	client          *http.Client
++	maxRequestBytes int64
++	maxReplayBytes  int64
++
++	mu      sync.Mutex
++	entries map[[32]byte]*ledgerEntry
++}
++
++type ledgerEntry struct {
++	done chan struct{}
++
++	status int
++	header http.Header
++	body   []byte
++}
++
++type streamEvent struct {
++	Type         string `json:"type"`
++	ContentBlock struct {
++		Type string `json:"type"`
++		ID   string `json:"id"`
++	} `json:"content_block"`
++}
++
++// ParseTarget validates a non-production loopback HTTP target.
++func ParseTarget(raw string) (*url.URL, error) {
++	target, err := url.Parse(strings.TrimSpace(raw))
++	if err != nil {
++		return nil, fmt.Errorf("parse target: %w", err)
++	}
++	if target.Scheme != "http" {
++		return nil, errors.New("gateway target must use loopback HTTP")
++	}
++	host := strings.TrimSpace(strings.ToLower(target.Hostname()))
++	if host != "127.0.0.1" && host != "localhost" && host != "::1" {
++		return nil, errors.New("gateway target must be loopback")
++	}
++	portText := target.Port()
++	if portText == "" {
++		return nil, errors.New("gateway target must include an explicit port")
++	}
++	port, err := strconv.Atoi(portText)
++	if err != nil || port <= 0 || port > 65535 {
++		return nil, errors.New("gateway target port is invalid")
++	}
++	if port == productionPort {
++		return nil, errors.New("gateway target may not use production port 8317")
++	}
++	if target.RawQuery != "" || target.Fragment != "" {
++		return nil, errors.New("gateway target may not include query or fragment")
++	}
++	copyTarget := *target
++	copyTarget.Path = strings.TrimSuffix(copyTarget.Path, "/")
++	return &copyTarget, nil
++}
++
++// New creates an invocation-scoped gateway.
++func New(config Config) (*Gateway, error) {
++	if config.Target == nil {
++		return nil, errors.New("gateway target is required")
++	}
++	target, err := ParseTarget(config.Target.String())
++	if err != nil {
++		return nil, err
++	}
++	if config.MaxRequestBodyBytes <= 0 {
++		config.MaxRequestBodyBytes = 64 << 20
++	}
++	if config.MaxReplayBytes <= 0 {
++		config.MaxReplayBytes = 64 << 20
++	}
++	if config.ConnectTimeout <= 0 {
++		config.ConnectTimeout = 30 * time.Second
++	}
++
++	transport := &http.Transport{
++		Proxy:              nil,
++		DialContext:        (&net.Dialer{Timeout: config.ConnectTimeout}).DialContext,
++		DisableCompression: true,
++		ForceAttemptHTTP2:  false,
++	}
++	return &Gateway{
++		target: target,
++		client: &http.Client{
++			Transport: transport,
++		},
++		maxRequestBytes: config.MaxRequestBodyBytes,
++		maxReplayBytes:  config.MaxReplayBytes,
++		entries:         make(map[[32]byte]*ledgerEntry),
++	}, nil
++}
++
++// ServeHTTP implements the retry and replay boundary.
++func (g *Gateway) ServeHTTP(w http.ResponseWriter, request *http.Request) {
++	body, err := readLimited(request.Body, g.maxRequestBytes)
++	if err != nil {
++		writeClaudeError(w, http.StatusRequestEntityTooLarge, "request body exceeds gateway limit")
++		return
++	}
++	key := requestFingerprint(request, body)
++	entry, owner := g.acquire(key)
++	if !owner {
++		select {
++		case <-request.Context().Done():
++			return
++		case <-entry.done:
++			writeStoredResponse(w, entry)
++			return
++		}
++	}
++
++	g.forwardOwner(w, request, body, entry)
++}
++
++func (g *Gateway) acquire(key [32]byte) (*ledgerEntry, bool) {
++	g.mu.Lock()
++	defer g.mu.Unlock()
++	if existing := g.entries[key]; existing != nil {
++		return existing, false
++	}
++	entry := &ledgerEntry{done: make(chan struct{})}
++	g.entries[key] = entry
++	return entry, true
++}
++
++func (g *Gateway) forwardOwner(w http.ResponseWriter, request *http.Request, body []byte, entry *ledgerEntry) {
++	targetURL := *g.target
++	targetURL.Path = strings.TrimSuffix(g.target.Path, "/") + request.URL.Path
++	targetURL.RawQuery = request.URL.RawQuery
++	upstreamRequest, err := http.NewRequestWithContext(request.Context(), request.Method, targetURL.String(), bytes.NewReader(body))
++	if err != nil {
++		g.completeError(entry, http.StatusFailedDependency, "gateway could not create upstream request")
++		writeStoredResponse(w, entry)
++		return
++	}
++	upstreamRequest.Header = cloneForwardHeaders(request.Header)
++	upstreamRequest.Host = g.target.Host
++
++	response, err := g.client.Do(upstreamRequest)
++	if err != nil {
++		g.completeError(entry, http.StatusFailedDependency, "upstream request failed within the invocation budget")
++		writeStoredResponse(w, entry)
++		return
++	}
++	defer response.Body.Close()
++
++	if retryableStatus(response.StatusCode) {
++		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, g.maxReplayBytes+1))
++		g.completeError(entry, http.StatusFailedDependency, fmt.Sprintf("upstream status %d exhausted the invocation request budget", response.StatusCode))
++		writeStoredResponse(w, entry)
++		return
++	}
++
++	header := cloneResponseHeaders(response.Header)
++	if strings.Contains(strings.ToLower(response.Header.Get("Content-Type")), "text/event-stream") {
++		g.forwardSSE(w, response, entry, header)
++		return
++	}
++
++	responseBody, err := readLimited(response.Body, g.maxReplayBytes)
++	if err != nil {
++		g.completeError(entry, http.StatusBadGateway, "upstream response exceeds gateway replay limit")
++		writeStoredResponse(w, entry)
++		return
++	}
++	copyHeaders(w.Header(), header)
++	w.WriteHeader(response.StatusCode)
++	_, _ = w.Write(responseBody)
++	if responseContainsToolUse(responseBody) {
++		g.completeError(entry, http.StatusFailedDependency, "duplicate request blocked after a tool response")
++		return
++	}
++	g.complete(entry, response.StatusCode, header, responseBody)
++}
++
++func (g *Gateway) forwardSSE(w http.ResponseWriter, response *http.Response, entry *ledgerEntry, header http.Header) {
++	copyHeaders(w.Header(), header)
++	w.WriteHeader(response.StatusCode)
++	flusher, _ := w.(http.Flusher)
++
++	reader := bufio.NewReader(response.Body)
++	captured := make([]byte, 0, 4096)
++	captureEnabled := true
++	terminalSeen := false
++	toolUseSeen := false
++
++	for {
++		line, errRead := reader.ReadBytes('\n')
++		if len(line) > 0 {
++			if captureEnabled {
++				if int64(len(captured)+len(line)) > g.maxReplayBytes {
++					captureEnabled = false
++					captured = nil
++				} else {
++					captured = append(captured, line...)
++				}
++			}
++			if event, ok := parseSSEEvent(line); ok {
++				if event.Type == "message_stop" {
++					terminalSeen = true
++				}
++				if event.Type == "content_block_start" && event.ContentBlock.Type == "tool_use" {
++					toolUseSeen = true
++				}
++			}
++			_, _ = w.Write(line)
++			if flusher != nil {
++				flusher.Flush()
++			}
++		}
++		if errRead != nil {
++			if errors.Is(errRead, io.EOF) && terminalSeen {
++				if toolUseSeen || !captureEnabled {
++					g.completeError(entry, http.StatusFailedDependency, "duplicate request blocked after a non-replayable streaming response")
++				} else {
++					g.complete(entry, response.StatusCode, header, captured)
++				}
++				return
++			}
++			g.completeError(entry, http.StatusFailedDependency, "duplicate request blocked after an incomplete streaming response")
++			return
++		}
++	}
++}
++
++func (g *Gateway) complete(entry *ledgerEntry, status int, header http.Header, body []byte) {
++	entry.status = status
++	entry.header = header.Clone()
++	entry.body = bytes.Clone(body)
++	close(entry.done)
++}
++
++func (g *Gateway) completeError(entry *ledgerEntry, status int, message string) {
++	body := claudeErrorBody(message)
++	entry.status = status
++	entry.header = http.Header{"Content-Type": {"application/json"}}
++	entry.body = body
++	close(entry.done)
++}
++
++func readLimited(reader io.Reader, limit int64) ([]byte, error) {
++	if reader == nil {
++		return nil, nil
++	}
++	value, err := io.ReadAll(io.LimitReader(reader, limit+1))
++	if err != nil {
++		return nil, err
++	}
++	if int64(len(value)) > limit {
++		return nil, errors.New("body exceeds limit")
++	}
++	return value, nil
++}
++
++func requestFingerprint(request *http.Request, body []byte) [32]byte {
++	hash := sha256.New()
++	_, _ = io.WriteString(hash, request.Method)
++	_, _ = io.WriteString(hash, "\n")
++	_, _ = io.WriteString(hash, request.URL.EscapedPath())
++	_, _ = io.WriteString(hash, "?")
++	_, _ = io.WriteString(hash, request.URL.RawQuery)
++	_, _ = io.WriteString(hash, "\n")
++	for _, name := range []string{"Content-Type", "Anthropic-Version", "Anthropic-Beta"} {
++		_, _ = io.WriteString(hash, name)
++		_, _ = io.WriteString(hash, ":")
++		for _, value := range request.Header.Values(name) {
++			_, _ = io.WriteString(hash, value)
++			_, _ = io.WriteString(hash, "\x00")
++		}
++		_, _ = io.WriteString(hash, "\n")
++	}
++	_, _ = hash.Write(body)
++	var result [32]byte
++	copy(result[:], hash.Sum(nil))
++	return result
++}
++
++func retryableStatus(status int) bool {
++	return status == http.StatusRequestTimeout ||
++		status == http.StatusConflict ||
++		status == http.StatusTooManyRequests ||
++		status >= http.StatusInternalServerError
++}
++
++func parseSSEEvent(line []byte) (streamEvent, bool) {
++	trimmed := bytes.TrimSpace(line)
++	if !bytes.HasPrefix(trimmed, []byte("data:")) {
++		return streamEvent{}, false
++	}
++	data := bytes.TrimSpace(trimmed[len("data:"):])
++	if len(data) == 0 || bytes.Equal(data, []byte("[DONE]")) {
++		return streamEvent{}, false
++	}
++	var event streamEvent
++	if err := json.Unmarshal(data, &event); err != nil {
++		return streamEvent{}, false
++	}
++	return event, true
++}
++
++func responseContainsToolUse(body []byte) bool {
++	var response struct {
++		Content []struct {
++			Type string `json:"type"`
++		} `json:"content"`
++	}
++	if json.Unmarshal(body, &response) != nil {
++		return false
++	}
++	for _, block := range response.Content {
++		if block.Type == "tool_use" {
++			return true
++		}
++	}
++	return false
++}
++
++func cloneForwardHeaders(source http.Header) http.Header {
++	header := source.Clone()
++	removeHopByHopHeaders(header)
++	return header
++}
++
++func cloneResponseHeaders(source http.Header) http.Header {
++	header := source.Clone()
++	removeHopByHopHeaders(header)
++	return header
++}
++
++func removeHopByHopHeaders(header http.Header) {
++	for _, name := range []string{
++		"Connection",
++		"Proxy-Connection",
++		"Keep-Alive",
++		"Proxy-Authenticate",
++		"Proxy-Authorization",
++		"Te",
++		"Trailer",
++		"Transfer-Encoding",
++		"Upgrade",
++	} {
++		header.Del(name)
++	}
++}
++
++func copyHeaders(destination, source http.Header) {
++	for key, values := range source {
++		destination.Del(key)
++		for _, value := range values {
++			destination.Add(key, value)
++		}
++	}
++}
++
++func writeStoredResponse(w http.ResponseWriter, entry *ledgerEntry) {
++	copyHeaders(w.Header(), entry.header)
++	w.WriteHeader(entry.status)
++	_, _ = w.Write(entry.body)
++}
++
++func writeClaudeError(w http.ResponseWriter, status int, message string) {
++	w.Header().Set("Content-Type", "application/json")
++	w.WriteHeader(status)
++	_, _ = w.Write(claudeErrorBody(message))
++}
++
++func claudeErrorBody(message string) []byte {
++	body, _ := json.Marshal(map[string]any{
++		"type": "error",
++		"error": map[string]string{
++			"type":    "api_error",
++			"message": message,
++		},
++	})
++	return body
++}
+diff --git a/internal/claudegateway/gateway_test.go b/internal/claudegateway/gateway_test.go
+new file mode 100644
+index 0000000..7bd697a
+--- /dev/null
++++ b/internal/claudegateway/gateway_test.go
+@@ -0,0 +1,289 @@
++package claudegateway
++
++import (
++	"bytes"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++)
++
++func TestGatewayMapsRetryableFailureAndDeduplicatesRequests(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.WriteHeader(http.StatusInternalServerError)
++		_, _ = w.Write([]byte(`{"error":"synthetic"}`))
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	for range 2 {
++		status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test"}`))
++		if status != http.StatusFailedDependency {
++			t.Fatalf("status = %d, want 424", status)
++		}
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayCoalescesConcurrentDuplicateRequests(t *testing.T) {
++	var calls atomic.Int64
++	release := make(chan struct{})
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		<-release
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"ok"}]}`))
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	var wg sync.WaitGroup
++	statuses := make(chan int, 2)
++	for range 2 {
++		wg.Add(1)
++		go func() {
++			defer wg.Done()
++			status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test"}`))
++			statuses <- status
++		}()
++	}
++	for calls.Load() == 0 {
++		time.Sleep(time.Millisecond)
++	}
++	close(release)
++	wg.Wait()
++	close(statuses)
++
++	for status := range statuses {
++		if status != http.StatusOK {
++			t.Fatalf("status = %d, want 200", status)
++		}
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayReplaysCompletedTextStreamWithoutUpstreamReplay(t *testing.T) {
++	var calls atomic.Int64
++	stream := "data: {\"type\":\"message_start\"}\n\n" +
++		"data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\n" +
++		"data: {\"type\":\"message_stop\"}\n\n"
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, stream)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	for range 2 {
++		status, body := postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
++		if status != http.StatusOK || string(body) != stream {
++			t.Fatalf("status/body = %d/%q, want replayed stream", status, body)
++		}
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayNeverReplaysToolResponse(t *testing.T) {
++	var calls atomic.Int64
++	stream := "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"tool_use\",\"id\":\"tool_1\",\"name\":\"echo\"}}\n\n" +
++		"data: {\"type\":\"content_block_stop\",\"index\":0}\n\n" +
++		"data: {\"type\":\"message_stop\"}\n\n"
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, stream)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, body := postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
++	if status != http.StatusOK || !bytes.Contains(body, []byte(`"tool_use"`)) {
++		t.Fatalf("first tool response = %d/%q", status, body)
++	}
++	status, _ = postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
++	if status != http.StatusFailedDependency {
++		t.Fatalf("duplicate tool response status = %d, want 424", status)
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayBlocksRetryAfterIncompleteStream(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "text/event-stream")
++		_, _ = io.WriteString(w, "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n")
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	status, _ := postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
++	if status != http.StatusOK {
++		t.Fatalf("first partial response status = %d, want 200", status)
++	}
++	status, _ = postTestRequest(t, server.URL, []byte(`{"model":"test","stream":true}`))
++	if status != http.StatusFailedDependency {
++		t.Fatalf("duplicate partial response status = %d, want 424", status)
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1", got)
++	}
++}
++
++func TestGatewayFingerprintIncludesSemanticHeaders(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.Header().Set("Content-Type", "application/json")
++		_, _ = w.Write([]byte(`{"type":"message","content":[{"type":"text","text":"ok"}]}`))
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	for _, beta := range []string{"feature-a", "feature-b"} {
++		status, _ := postTestRequestWithHeaders(t, server.URL, []byte(`{"model":"test"}`), map[string]string{
++			"Anthropic-Version": "2023-06-01",
++			"Anthropic-Beta":    beta,
++		})
++		if status != http.StatusOK {
++			t.Fatalf("status = %d, want 200", status)
++		}
++	}
++	if got := calls.Load(); got != 2 {
++		t.Fatalf("upstream calls = %d, want 2 for distinct semantic headers", got)
++	}
++}
++
++func TestGatewayFingerprintIgnoresRetryMetadata(t *testing.T) {
++	var calls atomic.Int64
++	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
++		calls.Add(1)
++		w.WriteHeader(http.StatusInternalServerError)
++	}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	server := httptest.NewServer(gateway)
++	defer server.Close()
++
++	for _, retryCount := range []string{"0", "1"} {
++		status, _ := postTestRequestWithHeaders(t, server.URL, []byte(`{"model":"test"}`), map[string]string{
++			"X-Stainless-Retry-Count": retryCount,
++		})
++		if status != http.StatusFailedDependency {
++			t.Fatalf("status = %d, want 424", status)
++		}
++	}
++	if got := calls.Load(); got != 1 {
++		t.Fatalf("upstream calls = %d, want 1 when only retry metadata changes", got)
++	}
++}
++
++func TestGatewaySetsOnlyConnectionTimeout(t *testing.T) {
++	target := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
++	defer target.Close()
++
++	gateway := newTestGateway(t, target.URL)
++	if gateway.client.Timeout != 0 {
++		t.Fatalf("client timeout = %v, want no whole-request timeout", gateway.client.Timeout)
++	}
++	transport, ok := gateway.client.Transport.(*http.Transport)
++	if !ok {
++		t.Fatalf("transport type = %T, want *http.Transport", gateway.client.Transport)
++	}
++	if transport.ResponseHeaderTimeout != 0 {
++		t.Fatalf("response header timeout = %v, want none after connection", transport.ResponseHeaderTimeout)
++	}
++}
++
++func TestParseTargetRequiresNonProductionLoopback(t *testing.T) {
++	for _, raw := range []string{
++		"https://127.0.0.1:9000",
++		"http://example.com:9000",
++		"http://127.0.0.1:8317",
++		"http://127.0.0.1",
++	} {
++		if _, err := ParseTarget(raw); err == nil {
++			t.Fatalf("ParseTarget(%q) succeeded, want rejection", raw)
++		}
++	}
++	if _, err := ParseTarget("http://127.0.0.1:9000"); err != nil {
++		t.Fatalf("valid loopback target rejected: %v", err)
++	}
++}
++
++func newTestGateway(t *testing.T, targetURL string) *Gateway {
++	t.Helper()
++	target, err := ParseTarget(targetURL)
++	if err != nil {
++		t.Fatalf("ParseTarget: %v", err)
++	}
++	gateway, err := New(Config{
++		Target:         target,
++		ConnectTimeout: 2 * time.Second,
++	})
++	if err != nil {
++		t.Fatalf("New: %v", err)
++	}
++	return gateway
++}
++
++func postTestRequest(t *testing.T, baseURL string, body []byte) (int, []byte) {
++	t.Helper()
++	return postTestRequestWithHeaders(t, baseURL, body, nil)
++}
++
++func postTestRequestWithHeaders(t *testing.T, baseURL string, body []byte, headers map[string]string) (int, []byte) {
++	t.Helper()
++	request, err := http.NewRequest(http.MethodPost, baseURL+"/v1/messages", bytes.NewReader(body))
++	if err != nil {
++		t.Fatalf("NewRequest: %v", err)
++	}
++	request.Header.Set("Content-Type", "application/json")
++	request.Header.Set("Authorization", "Bearer synthetic-test-key")
++	for name, value := range headers {
++		request.Header.Set(name, value)
++	}
++	response, err := http.DefaultClient.Do(request)
++	if err != nil {
++		t.Fatalf("Do: %v", err)
++	}
++	defer response.Body.Close()
++	responseBody, err := io.ReadAll(response.Body)
++	if err != nil {
++		t.Fatalf("ReadAll: %v", err)
++	}
++	return response.StatusCode, responseBody
++}

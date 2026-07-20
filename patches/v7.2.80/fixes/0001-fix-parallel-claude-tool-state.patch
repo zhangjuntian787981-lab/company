@@ -1,0 +1,761 @@
+diff --git a/internal/translator/codex/claude/codex_claude_response.go b/internal/translator/codex/claude/codex_claude_response.go
+index b60e7c3..589ee0f 100644
+--- a/internal/translator/codex/claude/codex_claude_response.go
++++ b/internal/translator/codex/claude/codex_claude_response.go
+@@ -23,30 +23,33 @@ var (
+ 
+ // ConvertCodexResponseToClaudeParams holds parameters for response conversion.
+ type ConvertCodexResponseToClaudeParams struct {
+-	HasEmittedToolUse          bool
+-	BlockIndex                 int
+-	HasReceivedArgumentsDelta  bool
+-	FunctionCallBlockOpen      bool
+-	FunctionCallBlockCallID    string
+-	FunctionCallBlockIndex     int
+-	HasTextDelta               bool
+-	TextBlockOpen              bool
+-	ThinkingBlockOpen          bool
+-	ThinkingStopPending        bool
+-	ThinkingSignature          string
+-	ThinkingSummarySeen        bool
+-	WebSearchToolUseIDs        map[string]struct{}
+-	WebSearchToolResultIDs     map[string]struct{}
+-	LastWebSearchToolUseID     string
+-	PendingFunctionCalls       map[string]*pendingCodexFunctionCall
+-	LastPendingFunctionCallKey string
+-}
+-
+-type pendingCodexFunctionCall struct {
++	HasEmittedToolUse       bool
++	BlockIndex              int
++	HasTextDelta            bool
++	TextBlockOpen           bool
++	ThinkingBlockOpen       bool
++	ThinkingStopPending     bool
++	ThinkingSignature       string
++	ThinkingSummarySeen     bool
++	WebSearchToolUseIDs     map[string]struct{}
++	WebSearchToolResultIDs  map[string]struct{}
++	LastWebSearchToolUseID  string
++	FunctionCalls           map[string]*codexFunctionCallState
++	FunctionCallOrder       []*codexFunctionCallState
++	FunctionCallProtocolErr bool
++}
++
++type codexFunctionCallState struct {
+ 	CallID                    string
++	ItemID                    string
++	OutputIndex               string
++	Name                      string
+ 	Arguments                 string
++	BlockIndex                int
+ 	HasReceivedArgumentsDelta bool
++	ArgumentsEmitted          bool
+ 	StartEmitted              bool
++	StopEmitted               bool
+ }
+ 
+ // ConvertCodexResponseToClaude performs sophisticated streaming response format conversion.
+@@ -89,6 +92,12 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 
+ 	typeResult := rootResult.Get("type")
+ 	typeStr := typeResult.String()
++	if params.FunctionCallProtocolErr {
++		if typeStr == "response.completed" || typeStr == "response.incomplete" {
++			clearCodexFunctionCalls(params)
++		}
++		return [][]byte{output}
++	}
+ 	var template []byte
+ 
+ 	switch typeStr {
+@@ -136,9 +145,14 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 	case "response.completed", "response.incomplete":
+ 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+ 		responseData := rootResult.Get("response")
+-		output = hydrateOpenCodexFunctionCallFromTerminal(output, params, responseData)
++		hydrateCodexFunctionCallsFromTerminal(params, responseData)
++		if params.FunctionCallProtocolErr {
++			clearCodexFunctionCalls(params)
++			output = append(output, codexFunctionCallProtocolError()...)
++			break
++		}
+ 		output = append(output, finalizeCodexOpenContentBlocks(params)...)
+-		output = appendPendingCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON, responseData)
++		output = appendCodexFunctionCallsFromTerminal(output, params, originalRequestRawJSON)
+ 		template, _ = sjson.SetBytes(template, "delta.stop_reason", mapCodexStopReasonToClaude(codexStopReason(responseData), params.HasEmittedToolUse))
+ 		template = setClaudeStopSequence(template, "delta.stop_sequence", responseData)
+ 		inputTokens, outputTokens, cachedTokens := extractResponsesUsage(responseData.Get("usage"))
+@@ -157,25 +171,13 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 		case "function_call":
+ 			output = append(output, finalizeCodexThinkingBlock(params)...)
+ 			output = append(output, stopCodexTextBlock(params)...)
+-			params.HasReceivedArgumentsDelta = false
+-
+-			callID := codexFunctionCallID(itemResult)
+-			name := itemResult.Get("name").String()
+-			if name == "" {
+-				recordPendingCodexFunctionCall(params, rootResult, itemResult)
++			call, conflict := recordCodexFunctionCall(params, rootResult, itemResult)
++			if conflict {
++				params.FunctionCallProtocolErr = true
++				output = append(output, codexFunctionCallProtocolError()...)
+ 				break
+ 			}
+-
+-			if pending, pendingKeys := pendingCodexFunctionCallForDone(params, rootResult, itemResult); pending != nil {
+-				deletePendingCodexFunctionCallAliases(params, pendingKeys)
+-			}
+-			blockIndex := params.BlockIndex
+-			output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
+-			params.HasEmittedToolUse = true
+-			output = appendCodexFunctionCallArgumentDelta(output, "", blockIndex)
+-			params.FunctionCallBlockOpen = true
+-			params.FunctionCallBlockCallID = callID
+-			params.FunctionCallBlockIndex = blockIndex
++			output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
+ 		case "reasoning":
+ 			params.ThinkingSummarySeen = false
+ 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
+@@ -220,40 +222,18 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 			output = append(output, stopCodexTextBlock(params)...)
+ 			params.HasTextDelta = true
+ 		case "function_call":
+-			if pending, pendingKeys := pendingCodexFunctionCallForDone(params, rootResult, itemResult); pending != nil && !pending.StartEmitted {
+-				name := itemResult.Get("name").String()
+-				if name == "" {
+-					return [][]byte{output}
+-				}
+-				callID := pending.CallID
+-				if callID == "" {
+-					callID = codexFunctionCallID(itemResult)
+-				}
+-				blockIndex := params.BlockIndex
+-				output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
+-				params.HasEmittedToolUse = true
+-				pending.StartEmitted = true
+-
+-				args := pending.Arguments
+-				if args == "" {
+-					args = itemResult.Get("arguments").String()
+-				}
+-				if args != "" {
+-					output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
+-				}
+-				output = appendCodexFunctionCallStop(output, blockIndex)
+-				params.BlockIndex++
+-
+-				deletePendingCodexFunctionCallAliases(params, pendingKeys)
+-			} else if params.FunctionCallBlockOpen {
+-				if !params.HasReceivedArgumentsDelta {
+-					if args := itemResult.Get("arguments").String(); args != "" {
+-						output = appendCodexFunctionCallArgumentDelta(output, args, params.FunctionCallBlockIndex)
+-						params.HasReceivedArgumentsDelta = true
+-					}
+-				}
+-				output = appendCodexOpenFunctionCallStop(output, params)
++			call, conflict := recordCodexFunctionCall(params, rootResult, itemResult)
++			if conflict {
++				params.FunctionCallProtocolErr = true
++				output = append(output, codexFunctionCallProtocolError()...)
++				break
++			}
++			if !call.HasReceivedArgumentsDelta {
++				call.Arguments = itemResult.Get("arguments").String()
+ 			}
++			output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
++			output = flushCodexFunctionCallArguments(output, call)
++			output = stopCodexFunctionCall(output, call)
+ 		case "reasoning":
+ 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
+ 				params.ThinkingSignature = signature
+@@ -269,30 +249,29 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 			output = appendCodexWebSearchToolResult(output, params, rootResult, itemResult)
+ 		}
+ 	case "response.function_call_arguments.delta":
+-		delta := rootResult.Get("delta").String()
+-		key := codexArgumentsFunctionCallKey(params, rootResult)
+-		if pending, _ := pendingCodexFunctionCallForKey(params, key); pending != nil && !pending.StartEmitted {
+-			pending.HasReceivedArgumentsDelta = true
+-			pending.Arguments += delta
++		call := codexFunctionCallForArguments(params, rootResult)
++		if call == nil {
++			params.FunctionCallProtocolErr = true
++			output = append(output, codexFunctionCallProtocolError()...)
+ 			break
+ 		}
+-
+-		params.HasReceivedArgumentsDelta = true
+-		output = appendCodexFunctionCallArgumentDelta(output, delta, params.BlockIndex)
++		delta := rootResult.Get("delta").String()
++		call.HasReceivedArgumentsDelta = true
++		call.Arguments += delta
++		if call.StartEmitted && !call.StopEmitted {
++			output = appendCodexFunctionCallArgumentDelta(output, delta, call.BlockIndex)
++			call.ArgumentsEmitted = true
++		}
+ 	case "response.function_call_arguments.done":
+-		key := codexArgumentsFunctionCallKey(params, rootResult)
+-		if pending, _ := pendingCodexFunctionCallForKey(params, key); pending != nil && !pending.StartEmitted {
+-			if !pending.HasReceivedArgumentsDelta {
+-				pending.Arguments = rootResult.Get("arguments").String()
+-			}
++		call := codexFunctionCallForArguments(params, rootResult)
++		if call == nil {
++			params.FunctionCallProtocolErr = true
++			output = append(output, codexFunctionCallProtocolError()...)
+ 			break
+ 		}
+-
+-		if !params.HasReceivedArgumentsDelta {
+-			if args := rootResult.Get("arguments").String(); args != "" {
+-				output = appendCodexFunctionCallArgumentDelta(output, args, params.BlockIndex)
+-				params.HasReceivedArgumentsDelta = true
+-			}
++		if !call.HasReceivedArgumentsDelta {
++			call.Arguments = rootResult.Get("arguments").String()
++			output = flushCodexFunctionCallArguments(output, call)
+ 		}
+ 	}
+ 
+@@ -509,116 +488,167 @@ func setClaudeStopSequence(out []byte, path string, responseData gjson.Result) [
+ 	return out
+ }
+ 
+-func codexFunctionCallKey(rootResult, itemResult gjson.Result) string {
+-	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
+-		return "output:" + outputIndex.Raw
+-	}
+-	if callID := codexFunctionCallID(itemResult); callID != "" {
+-		return "call:" + callID
+-	}
+-	return "last"
+-}
+-
+ func codexFunctionCallID(itemResult gjson.Result) string {
+ 	return itemResult.Get("call_id").String()
+ }
+ 
+-func codexFunctionCallIDKey(callID string) string {
+-	if callID == "" {
+-		return ""
++func codexFunctionCallAliasKeys(rootResult, itemResult gjson.Result) []string {
++	keys := make([]string, 0, 6)
++	appendKey := func(prefix string, value gjson.Result) {
++		if !value.Exists() {
++			return
++		}
++		raw := value.String()
++		if raw == "" {
++			raw = value.Raw
++		}
++		if raw == "" {
++			return
++		}
++		key := prefix + raw
++		for _, existing := range keys {
++			if existing == key {
++				return
++			}
++		}
++		keys = append(keys, key)
+ 	}
+-	return "call:" + callID
+-}
+ 
+-func codexArgumentsFunctionCallKey(params *ConvertCodexResponseToClaudeParams, rootResult gjson.Result) string {
+-	if outputIndex := rootResult.Get("output_index"); outputIndex.Exists() {
+-		return "output:" + outputIndex.Raw
+-	}
+-	return params.LastPendingFunctionCallKey
++	appendKey("call:", rootResult.Get("call_id"))
++	appendKey("call:", itemResult.Get("call_id"))
++	appendKey("item:", rootResult.Get("item_id"))
++	appendKey("item:", itemResult.Get("id"))
++	appendKey("output:", rootResult.Get("output_index"))
++	appendKey("output:", itemResult.Get("output_index"))
++	return keys
+ }
+ 
+-func recordPendingCodexFunctionCall(params *ConvertCodexResponseToClaudeParams, rootResult, itemResult gjson.Result) {
+-	if params.PendingFunctionCalls == nil {
+-		params.PendingFunctionCalls = map[string]*pendingCodexFunctionCall{}
++func recordCodexFunctionCall(params *ConvertCodexResponseToClaudeParams, rootResult, itemResult gjson.Result) (*codexFunctionCallState, bool) {
++	if params == nil {
++		return nil, true
+ 	}
+-
+-	pending := &pendingCodexFunctionCall{CallID: codexFunctionCallID(itemResult)}
+-	key := codexFunctionCallKey(rootResult, itemResult)
+-	params.PendingFunctionCalls[key] = pending
+-	if callIDKey := codexFunctionCallIDKey(pending.CallID); callIDKey != "" {
+-		params.PendingFunctionCalls[callIDKey] = pending
+-	}
+-	params.LastPendingFunctionCallKey = key
+-}
+-
+-func pendingCodexFunctionCallForKey(params *ConvertCodexResponseToClaudeParams, key string) (*pendingCodexFunctionCall, string) {
+-	if params == nil || params.PendingFunctionCalls == nil || key == "" {
+-		return nil, ""
++	keys := codexFunctionCallAliasKeys(rootResult, itemResult)
++	if len(keys) == 0 {
++		return nil, true
+ 	}
+-	pending, ok := params.PendingFunctionCalls[key]
+-	if !ok {
+-		return nil, ""
++	if params.FunctionCalls == nil {
++		params.FunctionCalls = map[string]*codexFunctionCallState{}
+ 	}
+-	return pending, key
+-}
+ 
+-func pendingCodexFunctionCallForDone(params *ConvertCodexResponseToClaudeParams, rootResult, itemResult gjson.Result) (*pendingCodexFunctionCall, []string) {
+-	if params == nil || params.PendingFunctionCalls == nil {
+-		return nil, nil
++	var call *codexFunctionCallState
++	for _, key := range keys {
++		candidate := params.FunctionCalls[key]
++		if candidate == nil {
++			continue
++		}
++		if call != nil && call != candidate {
++			return nil, true
++		}
++		call = candidate
+ 	}
+-
+-	keys := []string{codexFunctionCallKey(rootResult, itemResult)}
+-	callID := codexFunctionCallID(itemResult)
+-	if callID != "" {
+-		keys = appendUniqueCodexFunctionCallKey(keys, codexFunctionCallIDKey(callID))
+-	} else if !rootResult.Get("output_index").Exists() && params.LastPendingFunctionCallKey != "" {
+-		keys = appendUniqueCodexFunctionCallKey(keys, params.LastPendingFunctionCallKey)
++	if call == nil {
++		call = &codexFunctionCallState{}
++		params.FunctionCallOrder = append(params.FunctionCallOrder, call)
+ 	}
+ 
+ 	for _, key := range keys {
+-		if pending, ok := params.PendingFunctionCalls[key]; ok {
+-			return pending, keysForPendingCodexFunctionCall(params, pending)
++		if candidate := params.FunctionCalls[key]; candidate != nil && candidate != call {
++			return nil, true
+ 		}
++		params.FunctionCalls[key] = call
+ 	}
+-	return nil, nil
+-}
+-
+-func appendUniqueCodexFunctionCallKey(keys []string, key string) []string {
+-	if key == "" {
+-		return keys
++	if call.CallID == "" {
++		call.CallID = itemResult.Get("call_id").String()
++		if call.CallID == "" {
++			call.CallID = rootResult.Get("call_id").String()
++		}
++	}
++	if call.ItemID == "" {
++		call.ItemID = itemResult.Get("id").String()
++		if call.ItemID == "" {
++			call.ItemID = rootResult.Get("item_id").String()
++		}
+ 	}
+-	for _, existing := range keys {
+-		if existing == key {
+-			return keys
++	if call.OutputIndex == "" {
++		call.OutputIndex = rootResult.Get("output_index").Raw
++		if call.OutputIndex == "" {
++			call.OutputIndex = itemResult.Get("output_index").Raw
+ 		}
+ 	}
+-	return append(keys, key)
++	if name := itemResult.Get("name").String(); name != "" {
++		call.Name = name
++	}
++	if args := itemResult.Get("arguments").String(); args != "" && !call.HasReceivedArgumentsDelta {
++		call.Arguments = args
++	}
++	return call, false
+ }
+ 
+-func keysForPendingCodexFunctionCall(params *ConvertCodexResponseToClaudeParams, pending *pendingCodexFunctionCall) []string {
+-	if params == nil || pending == nil || params.PendingFunctionCalls == nil {
++func codexFunctionCallForArguments(params *ConvertCodexResponseToClaudeParams, rootResult gjson.Result) *codexFunctionCallState {
++	if params == nil || len(params.FunctionCallOrder) == 0 {
+ 		return nil
+ 	}
+ 
+-	keys := make([]string, 0, 2)
+-	for key, candidate := range params.PendingFunctionCalls {
+-		if candidate == pending {
+-			keys = append(keys, key)
++	var call *codexFunctionCallState
++	for _, key := range codexFunctionCallAliasKeys(rootResult, gjson.Result{}) {
++		candidate := params.FunctionCalls[key]
++		if candidate == nil {
++			continue
++		}
++		if call != nil && call != candidate {
++			return nil
+ 		}
++		call = candidate
+ 	}
+-	return keys
++	if call != nil {
++		return call
++	}
++
++	for _, candidate := range params.FunctionCallOrder {
++		if candidate == nil || candidate.StopEmitted {
++			continue
++		}
++		if call != nil {
++			return nil
++		}
++		call = candidate
++	}
++	return call
+ }
+ 
+-func deletePendingCodexFunctionCallAliases(params *ConvertCodexResponseToClaudeParams, keys []string) {
+-	if params == nil || params.PendingFunctionCalls == nil {
+-		return
++func startCodexFunctionCall(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, call *codexFunctionCallState) []byte {
++	if params == nil || call == nil || call.StartEmitted || call.Name == "" {
++		return output
+ 	}
+-	for _, key := range keys {
+-		delete(params.PendingFunctionCalls, key)
+-		if params.LastPendingFunctionCallKey == key {
+-			params.LastPendingFunctionCallKey = ""
+-		}
++	call.BlockIndex = params.BlockIndex
++	params.BlockIndex++
++	output = appendCodexFunctionCallStart(output, originalRequestRawJSON, call.CallID, call.Name, call.BlockIndex)
++	call.StartEmitted = true
++	params.HasEmittedToolUse = true
++	return output
++}
++
++func flushCodexFunctionCallArguments(output []byte, call *codexFunctionCallState) []byte {
++	if call == nil || !call.StartEmitted || call.StopEmitted || call.ArgumentsEmitted || call.Arguments == "" {
++		return output
+ 	}
++	output = appendCodexFunctionCallArgumentDelta(output, call.Arguments, call.BlockIndex)
++	call.ArgumentsEmitted = true
++	return output
++}
++
++func stopCodexFunctionCall(output []byte, call *codexFunctionCallState) []byte {
++	if call == nil || !call.StartEmitted || call.StopEmitted {
++		return output
++	}
++	output = appendCodexFunctionCallStop(output, call.BlockIndex)
++	call.StopEmitted = true
++	return output
++}
++
++func codexFunctionCallProtocolError() []byte {
++	payload := []byte(`{"type":"error","error":{"type":"api_error","message":"ambiguous Codex function-call argument event"}}`)
++	return translatorcommon.AppendSSEEventBytes(nil, "error", payload, 2)
+ }
+ 
+ func appendCodexFunctionCallStart(output []byte, originalRequestRawJSON []byte, callID, name string, blockIndex int) []byte {
+@@ -642,131 +672,54 @@ func appendCodexFunctionCallStop(output []byte, blockIndex int) []byte {
+ 	return translatorcommon.AppendSSEEventBytes(output, "content_block_stop", template, 2)
+ }
+ 
+-func appendCodexOpenFunctionCallStop(output []byte, params *ConvertCodexResponseToClaudeParams) []byte {
+-	if params == nil || !params.FunctionCallBlockOpen {
+-		return output
+-	}
+-
+-	blockIndex := params.FunctionCallBlockIndex
+-	output = appendCodexFunctionCallStop(output, blockIndex)
+-	if params.BlockIndex <= blockIndex {
+-		params.BlockIndex = blockIndex + 1
+-	}
+-	params.FunctionCallBlockOpen = false
+-	params.FunctionCallBlockCallID = ""
+-	params.FunctionCallBlockIndex = 0
+-	return output
+-}
+-
+-func hydrateOpenCodexFunctionCallFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, responseData gjson.Result) []byte {
+-	if params == nil || !params.FunctionCallBlockOpen || params.HasReceivedArgumentsDelta {
+-		return output
++func hydrateCodexFunctionCallsFromTerminal(params *ConvertCodexResponseToClaudeParams, responseData gjson.Result) {
++	if params == nil {
++		return
+ 	}
+-
+ 	responseData.Get("output").ForEach(func(_, item gjson.Result) bool {
+-		if item.Get("type").String() != "function_call" || codexFunctionCallID(item) != params.FunctionCallBlockCallID {
+-			return true
+-		}
+-		if args := item.Get("arguments").String(); args != "" {
+-			output = appendCodexFunctionCallArgumentDelta(output, args, params.FunctionCallBlockIndex)
+-			params.HasReceivedArgumentsDelta = true
+-		}
+-		return false
+-	})
+-	return output
+-}
+-
+-func appendPendingCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte, responseData gjson.Result) []byte {
+-	if params == nil || len(params.PendingFunctionCalls) == 0 {
+-		return output
+-	}
+-
+-	responseData.Get("output").ForEach(func(index, item gjson.Result) bool {
+ 		if item.Get("type").String() != "function_call" {
+ 			return true
+ 		}
+-
+-		pending, pendingKeys := pendingCodexFunctionCallForTerminalItem(params, index, item)
+-		if pending == nil {
+-			return true
++		call, conflict := recordCodexFunctionCall(params, gjson.Result{}, item)
++		if conflict {
++			params.FunctionCallProtocolErr = true
++			return false
+ 		}
+-		if pending.StartEmitted {
+-			deletePendingCodexFunctionCallAliases(params, pendingKeys)
+-			return true
+-		}
+-
+-		name := item.Get("name").String()
+-		if name == "" {
+-			deletePendingCodexFunctionCallAliases(params, pendingKeys)
+-			return true
++		if call.Arguments == "" {
++			call.Arguments = item.Get("arguments").String()
+ 		}
+-		callID := pending.CallID
+-		if callID == "" {
+-			callID = codexFunctionCallID(item)
+-		}
+-
+-		blockIndex := params.BlockIndex
+-		output = appendCodexFunctionCallStart(output, originalRequestRawJSON, callID, name, blockIndex)
+-		params.HasEmittedToolUse = true
+-		pending.StartEmitted = true
+-
+-		args := item.Get("arguments").String()
+-		if args == "" {
+-			args = pending.Arguments
+-		}
+-		if args != "" {
+-			output = appendCodexFunctionCallArgumentDelta(output, args, blockIndex)
+-		}
+-		output = appendCodexFunctionCallStop(output, blockIndex)
+-		params.BlockIndex++
+-
+-		deletePendingCodexFunctionCallAliases(params, pendingKeys)
+ 		return true
+ 	})
+-
+-	clearPendingCodexFunctionCalls(params)
+-	return output
+ }
+ 
+-func pendingCodexFunctionCallForTerminalItem(params *ConvertCodexResponseToClaudeParams, outputIndex, item gjson.Result) (*pendingCodexFunctionCall, []string) {
+-	if params == nil || params.PendingFunctionCalls == nil {
+-		return nil, nil
+-	}
+-
+-	keys := make([]string, 0, 3)
+-	if callID := codexFunctionCallID(item); callID != "" {
+-		keys = appendUniqueCodexFunctionCallKey(keys, codexFunctionCallIDKey(callID))
+-	}
+-	if itemOutputIndex := item.Get("output_index"); itemOutputIndex.Exists() {
+-		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+itemOutputIndex.Raw)
+-	}
+-	if outputIndex.Exists() {
+-		keys = appendUniqueCodexFunctionCallKey(keys, "output:"+outputIndex.Raw)
++func appendCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte) []byte {
++	if params == nil {
++		return output
+ 	}
+-
+-	for _, key := range keys {
+-		if pending, ok := params.PendingFunctionCalls[key]; ok {
+-			return pending, keysForPendingCodexFunctionCall(params, pending)
++	for _, call := range params.FunctionCallOrder {
++		if call == nil || call.Name == "" {
++			continue
+ 		}
++		output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
++		output = flushCodexFunctionCallArguments(output, call)
++		output = stopCodexFunctionCall(output, call)
+ 	}
+-	return nil, nil
++	clearCodexFunctionCalls(params)
++	return output
+ }
+ 
+-func clearPendingCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
+-	if params == nil || params.PendingFunctionCalls == nil {
++func clearCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
++	if params == nil {
+ 		return
+ 	}
+-	for key := range params.PendingFunctionCalls {
+-		delete(params.PendingFunctionCalls, key)
+-	}
+-	params.LastPendingFunctionCallKey = ""
++	params.FunctionCalls = nil
++	params.FunctionCallOrder = nil
+ }
+ 
+ func finalizeCodexOpenContentBlocks(params *ConvertCodexResponseToClaudeParams) []byte {
+ 	output := make([]byte, 0, 256)
+ 	output = append(output, finalizeCodexThinkingBlock(params)...)
+ 	output = append(output, stopCodexTextBlock(params)...)
+-	output = appendCodexOpenFunctionCallStop(output, params)
+ 	return output
+ }
+ 
+diff --git a/internal/translator/codex/claude/codex_claude_response_test.go b/internal/translator/codex/claude/codex_claude_response_test.go
+index adae514..dc373c7 100644
+--- a/internal/translator/codex/claude/codex_claude_response_test.go
++++ b/internal/translator/codex/claude/codex_claude_response_test.go
+@@ -645,6 +645,123 @@ func TestConvertCodexResponseToClaude_StreamUnnamedFunctionCallDoneByCallIDKeeps
+ 	}
+ }
+ 
++func TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIsolated(t *testing.T) {
++	ctx := context.Background()
++	originalRequest := []byte(`{"tools":[{"name":"alpha_tool"},{"name":"beta_tool"}]}`)
++	var param any
++
++	chunks := [][]byte{
++		[]byte(`data: {"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`),
++		[]byte(`data: {"type":"response.output_item.added","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"alpha_tool"}}`),
++		[]byte(`data: {"type":"response.output_item.added","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"beta_tool"}}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"{\"value\":\"al"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"{\"value\":\"be"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":0,"delta":"pha\",\"n\":1}"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","output_index":1,"delta":"ta\",\"n\":2}"}`),
++		[]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"type":"function_call","call_id":"call_a","name":"alpha_tool","arguments":"{\"value\":\"alpha\",\"n\":1}"}}`),
++		[]byte(`data: {"type":"response.output_item.done","output_index":1,"item":{"type":"function_call","call_id":"call_b","name":"beta_tool","arguments":"{\"value\":\"beta\",\"n\":2}"}}`),
++		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
++	}
++
++	toolIDs := map[int64]string{}
++	arguments := map[int64]string{}
++	stops := map[int64]int{}
++	for _, chunk := range chunks {
++		for _, out := range ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param) {
++			for _, line := range strings.Split(string(out), "\n") {
++				if !strings.HasPrefix(line, "data: ") {
++					continue
++				}
++				data := gjson.Parse(strings.TrimPrefix(line, "data: "))
++				index := data.Get("index").Int()
++				switch data.Get("type").String() {
++				case "content_block_start":
++					if data.Get("content_block.type").String() == "tool_use" {
++						toolIDs[index] = data.Get("content_block.id").String()
++					}
++				case "content_block_delta":
++					if data.Get("delta.type").String() == "input_json_delta" {
++						arguments[index] += data.Get("delta.partial_json").String()
++					}
++				case "content_block_stop":
++					stops[index]++
++				}
++			}
++		}
++	}
++
++	if toolIDs[0] != "call_a" || arguments[0] != `{"value":"alpha","n":1}` || stops[0] != 1 {
++		t.Fatalf("call_a state crossed calls: ids=%v arguments=%v stops=%v", toolIDs, arguments, stops)
++	}
++	if toolIDs[1] != "call_b" || arguments[1] != `{"value":"beta","n":2}` || stops[1] != 1 {
++		t.Fatalf("call_b state crossed calls: ids=%v arguments=%v stops=%v", toolIDs, arguments, stops)
++	}
++}
++
++func TestConvertCodexResponseToClaude_StreamArgumentDeltasResolveByCallAndItemID(t *testing.T) {
++	ctx := context.Background()
++	originalRequest := []byte(`{"tools":[{"name":"lookup"}]}`)
++	var param any
++
++	chunks := [][]byte{
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a"}}`),
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","id":"item_b","call_id":"call_b"}}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"{\"id\":"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","item_id":"item_b","delta":"{\"id\":2}"}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"1}"}`),
++		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_a","name":"lookup","arguments":"{\"id\":1}"}}`),
++		[]byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"call_b","name":"lookup","arguments":"{\"id\":2}"}}`),
++	}
++
++	argumentsByID := map[string]string{}
++	indexToID := map[int64]string{}
++	for _, chunk := range chunks {
++		for _, out := range ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param) {
++			for _, line := range strings.Split(string(out), "\n") {
++				if !strings.HasPrefix(line, "data: ") {
++					continue
++				}
++				data := gjson.Parse(strings.TrimPrefix(line, "data: "))
++				index := data.Get("index").Int()
++				if data.Get("type").String() == "content_block_start" {
++					indexToID[index] = data.Get("content_block.id").String()
++				}
++				if data.Get("delta.type").String() == "input_json_delta" {
++					argumentsByID[indexToID[index]] += data.Get("delta.partial_json").String()
++				}
++			}
++		}
++	}
++
++	if argumentsByID["call_a"] != `{"id":1}` || argumentsByID["call_b"] != `{"id":2}` {
++		t.Fatalf("call_id argument streams crossed: %v", argumentsByID)
++	}
++}
++
++func TestConvertCodexResponseToClaude_StreamAmbiguousArgumentDeltaFailsClosed(t *testing.T) {
++	ctx := context.Background()
++	var param any
++	chunks := [][]byte{
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_a"}}`),
++		[]byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"call_b"}}`),
++		[]byte(`data: {"type":"response.function_call_arguments.delta","delta":"{}"}`),
++		[]byte(`data: {"type":"response.completed","response":{"usage":{"input_tokens":1,"output_tokens":1}}}`),
++	}
++
++	var output strings.Builder
++	for _, chunk := range chunks {
++		for _, out := range ConvertCodexResponseToClaude(ctx, "", nil, nil, chunk, &param) {
++			output.Write(out)
++		}
++	}
++	if !strings.Contains(output.String(), `"ambiguous Codex function-call argument event"`) {
++		t.Fatalf("missing fail-closed protocol error: %s", output.String())
++	}
++	if strings.Contains(output.String(), `"type":"message_delta"`) {
++		t.Fatalf("ambiguous function-call stream must not terminate successfully: %s", output.String())
++	}
++}
++
+ func TestConvertCodexResponseToClaude_StreamDeferredUnnamedFunctionCallDoesNotReserveBlockIndex(t *testing.T) {
+ 	ctx := context.Background()
+ 	originalRequest := []byte(`{"tools":[{"name":"lookup","description":"lookup"}]}`)
+@@ -801,8 +918,8 @@ func TestConvertCodexResponseToClaude_StreamUnresolvedPendingFunctionCallDoesNot
+ 		t.Fatalf("stop_reason = %q, want end_turn. Outputs=%q", gotReason, outputs)
+ 	}
+ 	params, ok := param.(*ConvertCodexResponseToClaudeParams)
+-	if !ok || len(params.PendingFunctionCalls) != 0 || params.LastPendingFunctionCallKey != "" {
+-		t.Fatalf("pending function calls were not cleared: %#v", param)
++	if !ok || len(params.FunctionCalls) != 0 || len(params.FunctionCallOrder) != 0 {
++		t.Fatalf("function calls were not cleared: %#v", param)
+ 	}
+ }
+ 

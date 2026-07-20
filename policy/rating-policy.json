@@ -1,0 +1,270 @@
+{
+  "schema_version": 2,
+  "ratings": ["PASS", "CONDITIONAL", "FAIL", "UNVERIFIED"],
+  "dimensions": [
+    "Security",
+    "Protocol",
+    "Tools",
+    "Resilience",
+    "Model/Context",
+    "Operability"
+  ],
+  "hard_failures": [
+    "secret or raw body persisted in report artifacts",
+    "parallel tool arguments cross call IDs",
+    "disconnect or incomplete classified as successful completion",
+    "unbounded retry or duplicate tool side effect",
+    "production port, process, launchd label, or baseline file changed",
+    "unexpected main or subagent model",
+    "unapproved real network request"
+  ],
+  "overall": {
+    "FAIL": "any hard failure or failed dimension",
+    "CONDITIONAL": "no failure, but one or more required checks are not PASS",
+    "PASS": "all six dimensions and every required case, stage, contract, identity, and artifact check pass"
+  },
+  "final_report": {
+    "max_evidence_age_seconds": 604800,
+    "future_clock_skew_seconds": 300,
+    "manifest_path": "patches/v7.2.80/manifest.json",
+    "manifest_dimension": "Operability",
+    "contracts_path": "patches/v7.2.80/contracts.json",
+    "contracts_dimension": "Protocol",
+    "default_hard_failure_dimension": "Operability",
+    "baseline": {
+      "pattern": "final-*/final-report.json",
+      "required_overall": "FAIL",
+      "dimension": "Operability"
+    },
+    "contract_classifications": {
+      "DROPPED_SILENTLY": {
+        "dimension": "Protocol",
+        "rating": "CONDITIONAL",
+        "blocks_pass": true
+      }
+    },
+    "candidate_artifacts": [
+      {
+        "id": "candidate_binary",
+        "path": "artifacts/cliproxyapi-v7.2.80-candidate",
+        "dimension": "Operability",
+        "required": true
+      },
+      {
+        "id": "gateway_binary",
+        "path": "artifacts/claude-budget-gateway-v7.2.80-candidate",
+        "dimension": "Operability",
+        "required": true
+      }
+    ],
+    "required_stages": [
+      {
+        "id": "source_boundary",
+        "pattern": "source-boundary-*/protocol-contracts.json",
+        "status_path": "summary.overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Protocol", "Tools", "Resilience", "Operability"],
+        "checks": [
+          {"path": "vendor_clean_after", "equals": true},
+          {"path": "stages.cleanup.status", "equals": "PASS"},
+          {"path": "stages.supplemental.status", "equals": "PASS"}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"}
+        ]
+      },
+      {
+        "id": "bottle_black_box",
+        "pattern": "*/rating.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Protocol", "Tools", "Resilience", "Model/Context", "Operability"],
+        "cases_path": "cases.json",
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"},
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"},
+          {"path": "gateway_binary_sha256", "expected": "artifacts.gateway_binary.sha256"}
+        ],
+        "required_cases": [
+          {"id": "redaction-canary", "dimension": "Security"},
+          {"id": "cliproxyapi-claude-json", "dimension": "Protocol"},
+          {"id": "cliproxyapi-claude-sse", "dimension": "Protocol"},
+          {"id": "cliproxyapi-field-degradations", "dimension": "Protocol"},
+          {"id": "cliproxyapi-single-tool", "dimension": "Tools"},
+          {"id": "cliproxyapi-parallel-tools", "dimension": "Tools"},
+          {"id": "cliproxyapi-http-500-no-retry", "dimension": "Resilience"},
+          {"id": "cliproxyapi-http-429-no-retry", "dimension": "Resilience"},
+          {"id": "cliproxyapi-disconnect-no-retry", "dimension": "Resilience"},
+          {"id": "cliproxyapi-partial-stream-no-replay", "dimension": "Resilience"},
+          {"id": "cliproxyapi-token-count", "dimension": "Model/Context"},
+          {"id": "process-cleanup", "dimension": "Operability"},
+          {"id": "production-untouched", "dimension": "Operability"}
+        ]
+      },
+      {
+        "id": "synthetic_oauth",
+        "pattern": "synthetic-oauth-*/synthetic-oauth.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Resilience", "Operability"],
+        "checks": [
+          {"path": "production_untouched", "equals": true},
+          {"path": "credential_values_persisted", "equals": false}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"},
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"}
+        ],
+        "required_cases": [
+          {"id": "cliproxyapi-synthetic-oauth-file-refresh", "dimension": "Security"}
+        ]
+      },
+      {
+        "id": "isolated_launchd",
+        "pattern": "isolated-launchd-*/isolated-launchd.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Operability"],
+        "checks": [
+          {"path": "production_untouched", "equals": true}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"},
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"},
+          {"path": "gateway_binary_sha256", "expected": "artifacts.gateway_binary.sha256"}
+        ],
+        "required_cases": [
+          {"id": "isolated-launchd", "dimension": "Operability"}
+        ]
+      },
+      {
+        "id": "claude_code_e2e",
+        "pattern": "claude-code-e2e-*/claude-code-e2e.json",
+        "status_path": "overall",
+        "pass_values": ["PASS", "CONDITIONAL"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Protocol", "Tools", "Resilience", "Model/Context", "Operability"],
+        "checks": [
+          {"path": "production_untouched", "equals": true}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"},
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"},
+          {"path": "gateway_binary_sha256", "expected": "artifacts.gateway_binary.sha256"}
+        ],
+        "required_cases": [
+          {"id": "claude-code-safe-wrapper", "dimension": "Security"},
+          {"id": "claude-code-json-text", "dimension": "Protocol"},
+          {"id": "claude-code-stream-json", "dimension": "Protocol"},
+          {"id": "claude-code-mcp-loop", "dimension": "Tools"},
+          {"id": "claude-code-sdk-retry", "dimension": "Resilience"},
+          {"id": "claude-code-explicit-model", "dimension": "Model/Context"},
+          {"id": "claude-code-default-model", "dimension": "Model/Context"},
+          {"id": "claude-code-subagent-route", "dimension": "Model/Context"},
+          {"id": "claude-code-local-compact", "dimension": "Model/Context"},
+          {"id": "claude-code-login-shell-matrix", "dimension": "Operability"},
+          {"id": "process-cleanup", "dimension": "Operability"},
+          {"id": "production-untouched", "dimension": "Operability"}
+        ]
+      },
+      {
+        "id": "real_upstream",
+        "requires_explicit_authorization": true,
+        "pattern": "real-upstream-*/real-upstream.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Protocol", "Tools", "Model/Context", "Operability"],
+        "checks": [
+          {"path": "production_untouched", "equals": true},
+          {"path": "credential_values_persisted", "equals": false}
+        ],
+        "required_cases": [
+          {"id": "real-json-text", "dimension": "Protocol"},
+          {"id": "real-stream-text", "dimension": "Protocol"},
+          {"id": "real-claude-code-mcp", "dimension": "Tools"},
+          {"id": "real-subagent", "dimension": "Model/Context"},
+          {"id": "real-long-context-compact", "dimension": "Model/Context"},
+          {"id": "real-natural-oauth-refresh", "dimension": "Security"},
+          {"id": "production-untouched", "dimension": "Operability"}
+        ]
+      },
+      {
+        "id": "source_validation",
+        "pattern": "source-validation-*/source-validation.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Protocol", "Tools", "Resilience", "Model/Context", "Operability"],
+        "checks": [
+          {"path": "checks.python_tests", "equals": true},
+          {"path": "checks.redaction_canary", "equals": true},
+          {"path": "checks.gofmt", "equals": true},
+          {"path": "checks.go_race", "equals": true},
+          {"path": "checks.go_test_all", "equals": true},
+          {"path": "checks.go_build_cleanup", "equals": true}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"}
+        ]
+      },
+      {
+        "id": "candidate_build",
+        "pattern": "candidate-build-*/candidate-build.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Operability"],
+        "checks": [
+          {"path": "checks.reproducible_build", "equals": true}
+        ],
+        "matches": [
+          {"path": "source_commit", "expected": "manifest.source_commit"},
+          {"path": "patch_set_sha256", "expected": "manifest.patch_set_sha256"},
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"},
+          {"path": "gateway_binary_sha256", "expected": "artifacts.gateway_binary.sha256"}
+        ]
+      },
+      {
+        "id": "local_soak",
+        "pattern": "soak-local-*/soak.json",
+        "status_path": "overall",
+        "pass_values": ["PASS"],
+        "fail_values": ["FAIL"],
+        "dimensions": ["Security", "Tools", "Resilience", "Operability"],
+        "checks": [
+          {"path": "checks.zero_duplicate_tools", "equals": true},
+          {"path": "checks.zero_budget_overruns", "equals": true},
+          {"path": "checks.zero_resource_leaks", "equals": true},
+          {"path": "checks.bounded_artifact_growth", "equals": true},
+          {"path": "checks.expected_upstream_attempts", "equals": true},
+          {"path": "checks.operation_matrix_passed", "equals": true},
+          {"path": "checks.duration_completed", "equals": true},
+          {"path": "checks.minimum_duration_met", "equals": true},
+          {"path": "checks.required_concurrency_covered", "equals": true},
+          {"path": "checks.production_untouched", "equals": true},
+          {"path": "checks.loopback_only", "equals": true}
+        ],
+        "matches": [
+          {"path": "candidate_binary_sha256", "expected": "artifacts.candidate_binary.sha256"},
+          {"path": "gateway_binary_sha256", "expected": "artifacts.gateway_binary.sha256"}
+        ]
+      }
+    ],
+    "decisions": {
+      "PASS": "Suitable for unrestricted use within the policy-defined Claude Code compatibility scope.",
+      "CONDITIONAL": "Validated only for the passing evidence; required compatibility evidence remains incomplete or unsupported.",
+      "FAIL": "Not reliable enough for unrestricted Claude Code use."
+    }
+  }
+}

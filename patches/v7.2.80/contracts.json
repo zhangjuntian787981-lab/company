@@ -1,0 +1,430 @@
+{
+  "schema_version": 1,
+  "classification_definitions": {
+    "SUPPORTED": "Preserved without a semantic downgrade.",
+    "TRANSLATED": "Mapped to a different protocol field or terminal semantic.",
+    "DROPPED_WITH_WARNING": "Omitted with an observable warning.",
+    "DROPPED_SILENTLY": "Omitted or weakened without an observable warning.",
+    "REJECTED": "Rejected as an error or unsafe to claim as compatible."
+  },
+  "contracts": [
+    {
+      "id": "tool-argument-delta-call-id-isolation",
+      "feature": "Two interleaved tool argument delta streams remain isolated by call ID.",
+      "classification": "SUPPORTED",
+      "observed": "The repair keeps function-call state isolated by call_id, item_id, and output_index, then emits complete tool blocks sequentially in stable order; ambiguous unkeyed deltas fail closed.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatInterleavedToolArgumentDeltasAreIsolatedByCallID"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIsolated"
+        }
+      ]
+    },
+    {
+      "id": "claude-request-attempt-budget",
+      "feature": "One Claude inbound request cannot replay generation across credentials, models, or configured retries unless a successful OAuth refresh authorizes one replay.",
+      "classification": "SUPPORTED",
+      "observed": "The request-scoped budget preserves the original provider error after one generation attempt, while allowing exactly one successful 401 refresh replay.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth",
+          "test": "TestManagerRequestBudgetStopsCrossCredentialAttempts"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth",
+          "test": "TestManagerRequestBudgetAllowsOneSuccessfulUnauthorizedRefreshReplay"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth",
+          "test": "TestRequestBudgetRefreshAttemptLimit"
+        }
+      ]
+    },
+    {
+      "id": "oauth-refresh-synthetic-safety",
+      "feature": "Synthetic OAuth refresh is deduplicated, bounded, redacted, and atomically persisted with private permissions.",
+      "classification": "SUPPORTED",
+      "observed": "Concurrent stale-token requests share one refresh; invalid_grant, 429, server failure, and timeout paths are bounded; response bodies cannot enter refresh errors; local auth-file replacement is atomic and mode 0600.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth",
+          "test": "TestManager_ConcurrentStaleTokenRefreshesOnce"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth",
+          "test": "TestFileTokenStoreOAuthRotationIsAtomicAndPrivate"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/auth",
+          "test": "TestFileTokenStoreOAuthRotationFailureKeepsPreviousFile"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex",
+          "test": "TestRefreshTokensWithRetry_InvalidGrantDoesNotLeakOrRetry"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex",
+          "test": "TestRefreshTokensWithRetry_429BlocksImmediateReplay"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/codex",
+          "test": "TestRefreshTokensWithRetry_TimeoutIsBounded"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude",
+          "test": "TestRefreshTokensWithRetry_InvalidGrantDoesNotLeakOrRetry"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/claude",
+          "test": "TestRefreshTokensWithRetry_TimeoutIsBounded"
+        }
+      ]
+    },
+    {
+      "id": "claude-invocation-gateway",
+      "feature": "One Claude Code invocation cannot replay an identical semantic request upstream after a retryable failure or non-replayable response.",
+      "classification": "SUPPORTED",
+      "observed": "The loopback-only gateway coalesces client retries by method, path, semantic headers, and normalized semantic body; a stream-mode fallback after an incomplete response cannot create a second upstream attempt.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway",
+          "test": "TestGatewayMapsRetryableFailureAndDeduplicatesRequests"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway",
+          "test": "TestGatewayFingerprintIncludesSemanticHeaders"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway",
+          "test": "TestGatewayRejectsToolIDWithChangedArguments"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway",
+          "test": "TestGatewayBuffersStreamingToolBeforeDuplicateCheck"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/claudegateway",
+          "test": "TestGatewayBlocksStreamingFallbackAfterIncompleteNonStreamingRequest"
+        }
+      ]
+    },
+    {
+      "id": "terminal-tool-event-idempotency",
+      "feature": "Duplicate done and terminal events cannot emit a tool block or terminal success twice.",
+      "classification": "SUPPORTED",
+      "observed": "Per-call start, argument, stop, and terminal state is monotonic; a duplicate terminal or late delta is ignored after exactly one message_stop.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertCodexResponseToClaude_StreamThreeCallsNestedAliasesAndDuplicateTerminalAreIdempotent"
+        }
+      ]
+    },
+    {
+      "id": "claude-model-catalog-aliases",
+      "feature": "The Claude model catalog publishes only explicit Claude aliases.",
+      "classification": "SUPPORTED",
+      "observed": "Raw GPT and compatibility IDs and legacy claude-fable-5-dd encodings are excluded from the Claude catalog without mutating the OpenAI catalog.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeCatalogModelsPublishesOnlyExplicitClaudeIDs"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeRequestPolicyIsCodexRouteScoped"
+        }
+      ]
+    },
+    {
+      "id": "terminal-response-completed",
+      "feature": "response.completed is accepted as the successful terminal event.",
+      "classification": "SUPPORTED",
+      "observed": "Completed terminates both JSON and streaming execution; later transport errors are ignored.",
+      "evidence": [
+        {
+          "origin": "UPSTREAM_BASELINE",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCodexExecutorExecuteIgnoresTransportErrorAfterCompletion"
+        },
+        {
+          "origin": "UPSTREAM_BASELINE",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCodexExecutorExecuteStreamIgnoresTransportErrorAfterCompletion"
+        }
+      ]
+    },
+    {
+      "id": "terminal-response-incomplete",
+      "feature": "response.incomplete caused by max_output_tokens becomes a successful truncated Claude response.",
+      "classification": "TRANSLATED",
+      "observed": "The executor accepts the partial response and maps max_output_tokens to Claude stop_reason=max_tokens, which is a successful Messages response with truncation.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCompatCodexExecutorIncompleteMaxTokensIsSuccessful"
+        }
+      ]
+    },
+    {
+      "id": "terminal-response-failed",
+      "feature": "response.failed is surfaced as an executor error.",
+      "classification": "REJECTED",
+      "observed": "A failed-only terminal frame is rejected for both JSON and streaming execution.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCompatCodexExecutorResponseFailedOnlyIsError"
+        }
+      ]
+    },
+    {
+      "id": "terminal-missing-after-partial-output",
+      "feature": "EOF after partial output and without a terminal frame is an error.",
+      "classification": "REJECTED",
+      "observed": "The executor emits a request-scoped 408 error; streaming may already have emitted partial payload.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCompatCodexExecutorMissingTerminalAfterPartialOutputIsError"
+        }
+      ]
+    },
+    {
+      "id": "terminal-first-byte-transport-break",
+      "feature": "A transport break after the first byte is an error.",
+      "classification": "REJECTED",
+      "observed": "Both JSON and streaming execution return a request-scoped 408 error.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor",
+          "test": "TestCompatCodexExecutorFirstByteThenTransportBreakIsError"
+        }
+      ]
+    },
+    {
+      "id": "stop-reason-mapping",
+      "feature": "Codex stop reasons map to Claude stop reasons.",
+      "classification": "TRANSLATED",
+      "observed": "stop, max_tokens, max_output_tokens, stop_sequence, pause_turn, refusal, content_filter, context-window exhaustion, and unknown reasons are deterministically mapped.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatStopReasonTranslation"
+        }
+      ]
+    },
+    {
+      "id": "request-max-tokens",
+      "feature": "Claude max_tokens controls Codex max_output_tokens and the client-visible response boundary.",
+      "classification": "TRANSLATED",
+      "observed": "Claude max_tokens is emitted as Codex max_output_tokens and independently enforced with the GPT-5 tokenizer for non-streaming and SSE responses; tool inputs are buffered atomically.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertClaudeRequestToCodex_MaxTokensMapping"
+        },
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatClaudeRequestProtocolMapping"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeNonStreamingMaxTokensTruncatesVisibleText"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeStreamingMaxTokensKeepsToolInputAtomic"
+        }
+      ]
+    },
+    {
+      "id": "terminal-max-output-tokens",
+      "feature": "Codex max_output_tokens terminal reason maps to Claude max_tokens.",
+      "classification": "TRANSLATED",
+      "observed": "The terminal reason is translated to Claude stop_reason=max_tokens.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatStopReasonTranslation"
+        }
+      ]
+    },
+    {
+      "id": "tool-strict",
+      "feature": "Tool strict=true is preserved.",
+      "classification": "SUPPORTED",
+      "observed": "Translated function tools preserve strict=true and schema semantics; unsafe or unsupported reference schemas are rejected with a JSON path before provider execution.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertClaudeRequestToCodex_ToolStrictMapping"
+        },
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatClaudeRequestProtocolMapping"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestPreflightClaudeRequestRejectsStrictReferenceKeywords"
+        }
+      ]
+    },
+    {
+      "id": "tool-defer-loading",
+      "feature": "Tool defer_loading is preserved or explicitly rejected.",
+      "classification": "REJECTED",
+      "observed": "Codex routes accept absent or false defer_loading and reject true with a path-specific 400 before provider execution; native Claude routes retain the field.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestPreflightClaudeRequestRejectsDeferLoadingTrue"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeRequestPolicyIsCodexRouteScoped"
+        }
+      ]
+    },
+    {
+      "id": "request-context-management",
+      "feature": "Claude Code context edits are safely applied before the Codex boundary.",
+      "classification": "TRANSLATED",
+      "observed": "Complete historical tool pairs can be cleared; clear_thinking_20251015 with keep=all is accepted as a no-op; active blocks remain and all other unsupported edit shapes are rejected.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeContextManagementClearsClosedHistoricalPairsAndKeepsActivePair"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeContextManagementRejectsUnknownOrParameterizedEdit"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeContextManagementAcceptsClaudeCodeClearThinking"
+        }
+      ]
+    },
+    {
+      "id": "request-document-block",
+      "feature": "Claude document content is represented at the Codex boundary.",
+      "classification": "TRANSLATED",
+      "observed": "Claude base64 and URL document blocks become Codex input_file content with a safe filename, while neighboring text order is preserved.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertClaudeRequestToCodex_DocumentContentMapping"
+        },
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatClaudeRequestProtocolMapping"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestPreflightClaudeRequestValidatesDocuments"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestPreflightClaudeRequestEnforcesDocumentSizeLimits"
+        }
+      ]
+    },
+    {
+      "id": "request-stop-sequences",
+      "feature": "Claude stop_sequences handling at the Codex boundary.",
+      "classification": "TRANSLATED",
+      "observed": "Codex routes enforce stop sequences at the Claude response boundary across SSE chunks without leaking stop text or truncating tool JSON; invalid values are rejected before execution.",
+      "evidence": [
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestConvertClaudeRequestToCodex_StopSequencesAreNotForwarded"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeStreamingStopSequenceSpansChunksWithoutLeakingText"
+        },
+        {
+          "origin": "REPAIR_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/sdk/api/handlers/claude",
+          "test": "TestClaudeStreamingStopSequenceNeverCutsToolJSON"
+        }
+      ]
+    },
+    {
+      "id": "adaptive-effort-default",
+      "feature": "Adaptive thinking without effort has a deterministic Codex effort.",
+      "classification": "TRANSLATED",
+      "observed": "No thinking field defaults to medium; adaptive with omitted effort defaults to xhigh.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatClaudeAdaptiveEffortTranslation"
+        }
+      ]
+    },
+    {
+      "id": "adaptive-effort-levels",
+      "feature": "Adaptive low, medium, high, xhigh, and max reach Codex reasoning.effort.",
+      "classification": "TRANSLATED",
+      "observed": "All five effort strings pass through the request translator for gpt-5.6-sol.",
+      "evidence": [
+        {
+          "origin": "SUPPLEMENTAL_PATCH",
+          "package": "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/codex/claude",
+          "test": "TestCompatClaudeAdaptiveEffortTranslation"
+        }
+      ]
+    }
+  ]
+}

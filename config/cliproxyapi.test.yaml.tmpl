@@ -1,0 +1,123 @@
+# Isolated v7.2.80 compatibility-test template. Never merge with user configuration.
+host: 127.0.0.1
+port: {{LISTEN_PORT}}
+auth-dir: {{AUTH_DIR}}
+api-keys:
+  - compat-synthetic-client-key
+debug: false
+logging-to-file: false
+usage-statistics-enabled: false
+request-retry: {{REQUEST_RETRY}}
+max-retry-credentials: 1
+max-retry-interval: {{MAX_RETRY_INTERVAL}}
+routing:
+  strategy: round-robin
+  session-affinity: false
+
+# The Codex executor appends /responses to this /v1 base URL.
+codex-api-key:
+  - api-key: compat-synthetic-upstream-key
+    base-url: {{MOCK_BASE_URL}}/v1
+    websockets: false
+    disable-cooling: {{DISABLE_COOLING}}
+    models:
+      - name: text
+        alias: compat-text
+        display-name: Compatibility Text Fixture
+        force-mapping: true
+      - name: text
+        alias: claude-opus-4-8
+        display-name: Compatibility Opus Route
+        force-mapping: true
+      - name: text
+        alias: claude-sonnet-5
+        display-name: Compatibility Sonnet Route
+        force-mapping: true
+      - name: text
+        alias: claude-haiku-4-5-20251001
+        display-name: Compatibility Haiku Route
+        force-mapping: true
+      - name: text
+        alias: claude-fable-5
+        display-name: Compatibility Fable Route
+        force-mapping: true
+      - name: text_stream
+        alias: compat-text-stream
+        display-name: Compatibility Streaming Text Fixture
+        force-mapping: true
+      - name: claude_code_agent
+        alias: compat-agent
+        display-name: Compatibility Agent Loop Fixture
+        force-mapping: true
+      - name: claude_code_mcp
+        alias: compat-mcp
+        display-name: Compatibility MCP Loop Fixture
+        force-mapping: true
+      - name: compact_before
+        alias: compat-compact-before
+        display-name: Compatibility Compact Before Threshold Fixture
+        force-mapping: true
+      - name: compact_at
+        alias: compat-compact-at
+        display-name: Compatibility Compact At Threshold Fixture
+        force-mapping: true
+      - name: compact_after
+        alias: compat-compact-after
+        display-name: Compatibility Compact After Threshold Fixture
+        force-mapping: true
+      - name: compact_tool
+        alias: compat-compact-tool
+        display-name: Compatibility Compact Tool Sequence Fixture
+        force-mapping: true
+      - name: compact_fail_500
+        alias: compat-compact-fail-500
+        display-name: Compatibility Compact HTTP 500 Sequence Fixture
+        force-mapping: true
+      - name: compact_fail_disconnect
+        alias: compat-compact-fail-disconnect
+        display-name: Compatibility Compact Disconnect Sequence Fixture
+        force-mapping: true
+      - name: compact_post_fail
+        alias: compat-compact-post-fail
+        display-name: Compatibility Post-Compact Failure Sequence Fixture
+        force-mapping: true
+      - name: single_tool
+        alias: compat-single-tool
+        display-name: Compatibility Single Tool Fixture
+        force-mapping: true
+      - name: parallel_interleaved_tools
+        alias: compat-parallel-tools
+        display-name: Compatibility Parallel Tools Fixture
+        force-mapping: true
+      - name: parallel_interleaved_tools_dynamic
+        alias: compat-parallel-tools-dynamic
+        display-name: Compatibility Dynamic Parallel Tools Fixture
+        force-mapping: true
+      - name: incomplete
+        alias: compat-incomplete
+        display-name: Compatibility Incomplete Fixture
+        force-mapping: true
+      - name: failed
+        alias: compat-failed
+        display-name: Compatibility Failed Fixture
+        force-mapping: true
+      - name: http_500
+        alias: compat-http-500
+        display-name: Compatibility HTTP 500 Fixture
+        force-mapping: true
+      - name: http_502
+        alias: compat-http-502
+        display-name: Compatibility HTTP 502 Fixture
+        force-mapping: true
+      - name: http_429
+        alias: compat-http-429
+        display-name: Compatibility HTTP 429 Fixture
+        force-mapping: true
+      - name: disconnect
+        alias: compat-disconnect
+        display-name: Compatibility Disconnect Fixture
+        force-mapping: true
+      - name: delay
+        alias: compat-delay
+        display-name: Compatibility Delay Fixture
+        force-mapping: true

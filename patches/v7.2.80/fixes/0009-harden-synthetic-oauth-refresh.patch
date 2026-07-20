@@ -1,0 +1,960 @@
+diff --git a/internal/auth/claude/anthropic_auth.go b/internal/auth/claude/anthropic_auth.go
+index d7ca154..9bd4ad2 100644
+--- a/internal/auth/claude/anthropic_auth.go
++++ b/internal/auth/claude/anthropic_auth.go
+@@ -27,6 +27,7 @@ const (
+ 	ClientID    = "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+ 	RedirectURI = "http://localhost:54545/callback"
+ 
++	claudeRefreshTimeout    = 30 * time.Second
+ 	claudeRefreshMinBackoff = 5 * time.Second
+ 	claudeRefreshMaxBackoff = 5 * time.Minute
+ )
+@@ -55,7 +56,6 @@ func resetClaudeRefreshState() {
+ 	claudeRefreshMu.Lock()
+ 	defer claudeRefreshMu.Unlock()
+ 	claudeRefreshBlock = make(map[string]time.Time)
+-	claudeRefreshGroup = singleflight.Group{}
+ }
+ 
+ func claudeRefreshBlockedUntil(refreshToken string) time.Time {
+@@ -114,6 +114,60 @@ func isClaudeRefreshRetryable(err error) bool {
+ 	return true
+ }
+ 
++func claudeRefreshContext(ctx context.Context) (context.Context, context.CancelFunc) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	deadline := time.Now().Add(claudeRefreshTimeout)
++	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
++		deadline = callerDeadline
++	}
++	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
++}
++
++func claudeOAuthErrorCode(body []byte) string {
++	var payload struct {
++		Code  string          `json:"code"`
++		Error json.RawMessage `json:"error"`
++	}
++	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
++		return ""
++	}
++	if code := safeClaudeOAuthErrorCode(payload.Code); code != "" {
++		return code
++	}
++	var rawCode string
++	if errUnmarshal := json.Unmarshal(payload.Error, &rawCode); errUnmarshal == nil {
++		return safeClaudeOAuthErrorCode(rawCode)
++	}
++	var nested struct {
++		Code string `json:"code"`
++		Type string `json:"type"`
++	}
++	if errUnmarshal := json.Unmarshal(payload.Error, &nested); errUnmarshal != nil {
++		return ""
++	}
++	if code := safeClaudeOAuthErrorCode(nested.Code); code != "" {
++		return code
++	}
++	return safeClaudeOAuthErrorCode(nested.Type)
++}
++
++func safeClaudeOAuthErrorCode(value string) string {
++	value = strings.TrimSpace(value)
++	if value == "" || len(value) > 64 {
++		return ""
++	}
++	for _, char := range value {
++		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
++			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
++			continue
++		}
++		return ""
++	}
++	return strings.ToLower(value)
++}
++
+ // tokenResponse represents the response structure from Anthropic's OAuth token endpoint.
+ // It contains access token, refresh token, and associated user/organization information.
+ type tokenResponse struct {
+@@ -331,6 +385,9 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
+ 	if refreshToken == "" {
+ 		return nil, fmt.Errorf("refresh token is required")
+ 	}
++	if ctx == nil {
++		ctx = context.Background()
++	}
+ 	if blockedUntil := claudeRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
+ 		return nil, &refreshHTTPError{
+ 			status:    http.StatusTooManyRequests,
+@@ -339,13 +396,21 @@ func (o *ClaudeAuth) RefreshTokens(ctx context.Context, refreshToken string) (*C
+ 		}
+ 	}
+ 
+-	result, err, _ := claudeRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
++	refreshCtx, cancelRefresh := claudeRefreshContext(ctx)
++	defer cancelRefresh()
++	resultChannel := claudeRefreshGroup.DoChan(refreshToken, func() (interface{}, error) {
++		return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
+ 	})
+-	if err != nil {
+-		return nil, err
++	var result singleflight.Result
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case result = <-resultChannel:
++	}
++	if result.Err != nil {
++		return nil, result.Err
+ 	}
+-	tokenData, ok := result.(*ClaudeTokenData)
++	tokenData, ok := result.Val.(*ClaudeTokenData)
+ 	if !ok || tokenData == nil {
+ 		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+ 	}
+@@ -394,7 +459,7 @@ func (o *ClaudeAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
+ 	}
+ 
+ 	if resp.StatusCode != http.StatusOK {
+-		message := string(body)
++		message := claudeOAuthErrorCode(body)
+ 		if resp.StatusCode == http.StatusTooManyRequests {
+ 			retryAfter := parseClaudeRetryAfter(resp)
+ 			setClaudeRefreshBlockedUntil(refreshToken, time.Now().Add(retryAfter))
+diff --git a/internal/auth/claude/anthropic_auth_test.go b/internal/auth/claude/anthropic_auth_test.go
+index 0b14d08..0136519 100644
+--- a/internal/auth/claude/anthropic_auth_test.go
++++ b/internal/auth/claude/anthropic_auth_test.go
+@@ -121,3 +121,99 @@ func TestRefreshTokens_DeduplicatesConcurrentRefresh(t *testing.T) {
+ 		t.Fatalf("expected exactly 1 upstream refresh call, got %d", got)
+ 	}
+ }
++
++func TestRefreshTokensWithRetry_InvalidGrantDoesNotLeakOrRetry(t *testing.T) {
++	resetClaudeRefreshState()
++	defer resetClaudeRefreshState()
++
++	const canary = "COMPAT-CANARY-OAUTH-31f8e2"
++	var calls int32
++	auth := &ClaudeAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				atomic.AddInt32(&calls, 1)
++				return &http.Response{
++					StatusCode: http.StatusBadRequest,
++					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"` + canary + `"}`)),
++					Header:     make(http.Header),
++					Request:    req,
++				}, nil
++			}),
++		},
++	}
++
++	_, errRefresh := auth.RefreshTokensWithRetry(context.Background(), "synthetic-invalid-refresh", 3)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want invalid_grant")
++	}
++	if !strings.Contains(errRefresh.Error(), "invalid_grant") {
++		t.Fatalf("refresh error = %v, want invalid_grant classification", errRefresh)
++	}
++	if strings.Contains(errRefresh.Error(), canary) {
++		t.Fatal("refresh error exposed the OAuth canary")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want 1", got)
++	}
++}
++
++func TestRefreshTokensWithRetry_ServerErrorIsBounded(t *testing.T) {
++	resetClaudeRefreshState()
++	defer resetClaudeRefreshState()
++
++	var calls int32
++	auth := &ClaudeAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				atomic.AddInt32(&calls, 1)
++				return &http.Response{
++					StatusCode: http.StatusInternalServerError,
++					Body:       io.NopCloser(strings.NewReader(`{"error":"server_error"}`)),
++					Header:     make(http.Header),
++					Request:    req,
++				}, nil
++			}),
++		},
++	}
++
++	_, errRefresh := auth.RefreshTokensWithRetry(context.Background(), "synthetic-server-refresh", 1)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want server error")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want configured bound 1", got)
++	}
++}
++
++func TestRefreshTokensWithRetry_TimeoutIsBounded(t *testing.T) {
++	resetClaudeRefreshState()
++	defer resetClaudeRefreshState()
++
++	var calls int32
++	finished := make(chan struct{})
++	auth := &ClaudeAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				defer close(finished)
++				atomic.AddInt32(&calls, 1)
++				<-req.Context().Done()
++				return nil, req.Context().Err()
++			}),
++		},
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	started := time.Now()
++	_, errRefresh := auth.RefreshTokensWithRetry(ctx, "synthetic-timeout-refresh", 3)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want timeout")
++	}
++	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
++		t.Fatalf("refresh timeout took %v, want bounded return", elapsed)
++	}
++	<-finished
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want 1 before deadline", got)
++	}
++}
+diff --git a/internal/auth/codex/openai_auth.go b/internal/auth/codex/openai_auth.go
+index 040703c..35d61d4 100644
+--- a/internal/auth/codex/openai_auth.go
++++ b/internal/auth/codex/openai_auth.go
+@@ -7,11 +7,13 @@ package codex
+ import (
+ 	"context"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
+ 	"net/url"
+ 	"strings"
++	"sync"
+ 	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+@@ -26,6 +28,10 @@ const (
+ 	TokenURL    = "https://auth.openai.com/oauth/token"
+ 	ClientID    = "app_EMoamEEZ73f0CkXaXp7hrann"
+ 	RedirectURI = "http://localhost:1455/auth/callback"
++
++	codexRefreshTimeout    = 30 * time.Second
++	codexRefreshMinBackoff = 5 * time.Second
++	codexRefreshMaxBackoff = 5 * time.Minute
+ )
+ 
+ // CodexAuth handles the OpenAI OAuth2 authentication flow.
+@@ -35,7 +41,131 @@ type CodexAuth struct {
+ 	httpClient *http.Client
+ }
+ 
+-var codexRefreshGroup singleflight.Group
++var (
++	codexRefreshGroup singleflight.Group
++	codexRefreshMu    sync.Mutex
++	codexRefreshBlock = make(map[string]time.Time)
++)
++
++type codexRefreshHTTPError struct {
++	status    int
++	code      string
++	retryable bool
++}
++
++func (e *codexRefreshHTTPError) Error() string {
++	if e.code != "" {
++		return fmt.Sprintf("token refresh failed with status %d: %s", e.status, e.code)
++	}
++	return fmt.Sprintf("token refresh failed with status %d", e.status)
++}
++
++func codexRefreshContext(ctx context.Context) (context.Context, context.CancelFunc) {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++	deadline := time.Now().Add(codexRefreshTimeout)
++	if callerDeadline, ok := ctx.Deadline(); ok && callerDeadline.Before(deadline) {
++		deadline = callerDeadline
++	}
++	return context.WithDeadline(context.WithoutCancel(ctx), deadline)
++}
++
++func codexRefreshBlockedUntil(refreshToken string) time.Time {
++	codexRefreshMu.Lock()
++	defer codexRefreshMu.Unlock()
++	blockedUntil := codexRefreshBlock[refreshToken]
++	if !blockedUntil.After(time.Now()) {
++		delete(codexRefreshBlock, refreshToken)
++		return time.Time{}
++	}
++	return blockedUntil
++}
++
++func setCodexRefreshBlockedUntil(refreshToken string, until time.Time) {
++	codexRefreshMu.Lock()
++	defer codexRefreshMu.Unlock()
++	codexRefreshBlock[refreshToken] = until
++}
++
++func clearCodexRefreshBlockedUntil(refreshToken string) {
++	codexRefreshMu.Lock()
++	defer codexRefreshMu.Unlock()
++	delete(codexRefreshBlock, refreshToken)
++}
++
++func parseCodexRetryAfter(resp *http.Response) time.Duration {
++	if resp == nil {
++		return codexRefreshMinBackoff
++	}
++	if raw := strings.TrimSpace(resp.Header.Get("Retry-After")); raw != "" {
++		if seconds, errParse := time.ParseDuration(raw + "s"); errParse == nil {
++			return clampCodexRefreshBackoff(seconds)
++		}
++		if when, errParse := http.ParseTime(raw); errParse == nil {
++			return clampCodexRefreshBackoff(time.Until(when))
++		}
++	}
++	if raw := strings.TrimSpace(resp.Header.Get("Retry-After-Ms")); raw != "" {
++		if milliseconds, errParse := time.ParseDuration(raw + "ms"); errParse == nil {
++			return clampCodexRefreshBackoff(milliseconds)
++		}
++	}
++	return codexRefreshMinBackoff
++}
++
++func clampCodexRefreshBackoff(value time.Duration) time.Duration {
++	if value < codexRefreshMinBackoff {
++		return codexRefreshMinBackoff
++	}
++	if value > codexRefreshMaxBackoff {
++		return codexRefreshMaxBackoff
++	}
++	return value
++}
++
++func codexOAuthErrorCode(body []byte) string {
++	var payload struct {
++		Code  string          `json:"code"`
++		Error json.RawMessage `json:"error"`
++	}
++	if errUnmarshal := json.Unmarshal(body, &payload); errUnmarshal != nil {
++		return ""
++	}
++	if code := safeOAuthErrorCode(payload.Code); code != "" {
++		return code
++	}
++	var rawCode string
++	if errUnmarshal := json.Unmarshal(payload.Error, &rawCode); errUnmarshal == nil {
++		return safeOAuthErrorCode(rawCode)
++	}
++	var nested struct {
++		Code string `json:"code"`
++		Type string `json:"type"`
++	}
++	if errUnmarshal := json.Unmarshal(payload.Error, &nested); errUnmarshal != nil {
++		return ""
++	}
++	if code := safeOAuthErrorCode(nested.Code); code != "" {
++		return code
++	}
++	return safeOAuthErrorCode(nested.Type)
++}
++
++func safeOAuthErrorCode(value string) string {
++	value = strings.TrimSpace(value)
++	if value == "" || len(value) > 64 {
++		return ""
++	}
++	for _, char := range value {
++		if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
++			(char >= '0' && char <= '9') || char == '_' || char == '-' || char == '.' {
++			continue
++		}
++		return ""
++	}
++	return strings.ToLower(value)
++}
+ 
+ // NewCodexAuth creates a new CodexAuth service instance.
+ // It initializes an HTTP client with proxy settings from the provided configuration.
+@@ -193,14 +323,25 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
+ 	if ctx == nil {
+ 		ctx = context.Background()
+ 	}
++	if blockedUntil := codexRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
++		return nil, &codexRefreshHTTPError{status: http.StatusTooManyRequests}
++	}
+ 
+-	result, err, _ := codexRefreshGroup.Do(refreshToken, func() (interface{}, error) {
+-		return o.refreshTokensSingleFlight(context.WithoutCancel(ctx), refreshToken)
++	refreshCtx, cancelRefresh := codexRefreshContext(ctx)
++	defer cancelRefresh()
++	resultChannel := codexRefreshGroup.DoChan(refreshToken, func() (interface{}, error) {
++		return o.refreshTokensSingleFlight(refreshCtx, refreshToken)
+ 	})
+-	if err != nil {
+-		return nil, err
++	var result singleflight.Result
++	select {
++	case <-ctx.Done():
++		return nil, ctx.Err()
++	case result = <-resultChannel:
++	}
++	if result.Err != nil {
++		return nil, result.Err
+ 	}
+-	tokenData, ok := result.(*CodexTokenData)
++	tokenData, ok := result.Val.(*CodexTokenData)
+ 	if !ok || tokenData == nil {
+ 		return nil, fmt.Errorf("token refresh failed: invalid single-flight result")
+ 	}
+@@ -208,6 +349,9 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
+ }
+ 
+ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken string) (*CodexTokenData, error) {
++	if blockedUntil := codexRefreshBlockedUntil(refreshToken); blockedUntil.After(time.Now()) {
++		return nil, &codexRefreshHTTPError{status: http.StatusTooManyRequests}
++	}
+ 	data := url.Values{
+ 		"client_id":     {ClientID},
+ 		"grant_type":    {"refresh_token"},
+@@ -239,7 +383,14 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
+ 	}
+ 
+ 	if resp.StatusCode != http.StatusOK {
+-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
++		if resp.StatusCode == http.StatusTooManyRequests {
++			setCodexRefreshBlockedUntil(refreshToken, time.Now().Add(parseCodexRetryAfter(resp)))
++		}
++		return nil, &codexRefreshHTTPError{
++			status:    resp.StatusCode,
++			code:      codexOAuthErrorCode(body),
++			retryable: resp.StatusCode >= http.StatusInternalServerError,
++		}
+ 	}
+ 
+ 	var tokenResp struct {
+@@ -267,6 +418,7 @@ func (o *CodexAuth) refreshTokensSingleFlight(ctx context.Context, refreshToken
+ 		email = claims.Email
+ 	}
+ 
++	clearCodexRefreshBlockedUntil(refreshToken)
+ 	return &CodexTokenData{
+ 		IDToken:      tokenResp.IDToken,
+ 		AccessToken:  tokenResp.AccessToken,
+@@ -329,8 +481,12 @@ func isNonRetryableRefreshErr(err error) bool {
+ 	if err == nil {
+ 		return false
+ 	}
++	var httpErr *codexRefreshHTTPError
++	if errors.As(err, &httpErr) {
++		return !httpErr.retryable
++	}
+ 	raw := strings.ToLower(err.Error())
+-	return strings.Contains(raw, "refresh_token_reused")
++	return strings.Contains(raw, "refresh_token_reused") || strings.Contains(raw, "invalid_grant")
+ }
+ 
+ // UpdateTokenStorage updates an existing CodexTokenStorage with new token data.
+diff --git a/internal/auth/codex/openai_auth_test.go b/internal/auth/codex/openai_auth_test.go
+index 20a02fd..58479f3 100644
+--- a/internal/auth/codex/openai_auth_test.go
++++ b/internal/auth/codex/openai_auth_test.go
+@@ -11,7 +11,6 @@ import (
+ 	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+-	"golang.org/x/sync/singleflight"
+ )
+ 
+ type roundTripFunc func(*http.Request) (*http.Response, error)
+@@ -21,10 +20,15 @@ func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+ }
+ 
+ func resetCodexRefreshGroupForTest() {
+-	codexRefreshGroup = singleflight.Group{}
++	codexRefreshMu.Lock()
++	codexRefreshBlock = make(map[string]time.Time)
++	codexRefreshMu.Unlock()
+ }
+ 
+ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
++	resetCodexRefreshGroupForTest()
++	t.Cleanup(resetCodexRefreshGroupForTest)
++
+ 	var calls int32
+ 	auth := &CodexAuth{
+ 		httpClient: &http.Client{
+@@ -52,6 +56,131 @@ func TestRefreshTokensWithRetry_NonRetryableOnlyAttemptsOnce(t *testing.T) {
+ 	}
+ }
+ 
++func TestRefreshTokensWithRetry_InvalidGrantDoesNotLeakOrRetry(t *testing.T) {
++	resetCodexRefreshGroupForTest()
++	t.Cleanup(resetCodexRefreshGroupForTest)
++
++	const canary = "COMPAT-CANARY-OAUTH-31f8e2"
++	var calls int32
++	auth := &CodexAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				atomic.AddInt32(&calls, 1)
++				return &http.Response{
++					StatusCode: http.StatusBadRequest,
++					Body:       io.NopCloser(strings.NewReader(`{"error":"invalid_grant","error_description":"` + canary + `"}`)),
++					Header:     make(http.Header),
++					Request:    req,
++				}, nil
++			}),
++		},
++	}
++
++	_, errRefresh := auth.RefreshTokensWithRetry(context.Background(), "synthetic-invalid-refresh", 3)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want invalid_grant")
++	}
++	if !strings.Contains(errRefresh.Error(), "invalid_grant") {
++		t.Fatalf("refresh error = %v, want invalid_grant classification", errRefresh)
++	}
++	if strings.Contains(errRefresh.Error(), canary) {
++		t.Fatal("refresh error exposed the OAuth canary")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want 1", got)
++	}
++}
++
++func TestRefreshTokensWithRetry_ServerErrorIsBounded(t *testing.T) {
++	resetCodexRefreshGroupForTest()
++	t.Cleanup(resetCodexRefreshGroupForTest)
++
++	var calls int32
++	auth := &CodexAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				atomic.AddInt32(&calls, 1)
++				return &http.Response{
++					StatusCode: http.StatusInternalServerError,
++					Body:       io.NopCloser(strings.NewReader(`{"error":"server_error"}`)),
++					Header:     make(http.Header),
++					Request:    req,
++				}, nil
++			}),
++		},
++	}
++
++	_, errRefresh := auth.RefreshTokensWithRetry(context.Background(), "synthetic-server-refresh", 1)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want server error")
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want configured bound 1", got)
++	}
++}
++
++func TestRefreshTokensWithRetry_TimeoutIsBounded(t *testing.T) {
++	resetCodexRefreshGroupForTest()
++	t.Cleanup(resetCodexRefreshGroupForTest)
++
++	var calls int32
++	finished := make(chan struct{})
++	auth := &CodexAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				defer close(finished)
++				atomic.AddInt32(&calls, 1)
++				<-req.Context().Done()
++				return nil, req.Context().Err()
++			}),
++		},
++	}
++	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
++	defer cancel()
++
++	started := time.Now()
++	_, errRefresh := auth.RefreshTokensWithRetry(ctx, "synthetic-timeout-refresh", 3)
++	if errRefresh == nil {
++		t.Fatal("RefreshTokensWithRetry() error = nil, want timeout")
++	}
++	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
++		t.Fatalf("refresh timeout took %v, want bounded return", elapsed)
++	}
++	<-finished
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("refresh attempts = %d, want 1 before deadline", got)
++	}
++}
++
++func TestRefreshTokensWithRetry_429BlocksImmediateReplay(t *testing.T) {
++	resetCodexRefreshGroupForTest()
++	t.Cleanup(resetCodexRefreshGroupForTest)
++
++	var calls int32
++	auth := &CodexAuth{
++		httpClient: &http.Client{
++			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
++				atomic.AddInt32(&calls, 1)
++				return &http.Response{
++					StatusCode: http.StatusTooManyRequests,
++					Body:       io.NopCloser(strings.NewReader(`{"error":"rate_limit_exceeded"}`)),
++					Header:     http.Header{"Retry-After": []string{"60"}},
++					Request:    req,
++				}, nil
++			}),
++		},
++	}
++
++	for attempt := 0; attempt < 2; attempt++ {
++		if _, errRefresh := auth.RefreshTokensWithRetry(context.Background(), "synthetic-rate-limited-refresh", 3); errRefresh == nil {
++			t.Fatalf("refresh %d error = nil, want rate limit", attempt+1)
++		}
++	}
++	if got := atomic.LoadInt32(&calls); got != 1 {
++		t.Fatalf("upstream refresh attempts = %d, want 1 with immediate replay blocked", got)
++	}
++}
++
+ func TestRefreshTokens_DeduplicatesConcurrentRefreshAcrossInstances(t *testing.T) {
+ 	resetCodexRefreshGroupForTest()
+ 	t.Cleanup(resetCodexRefreshGroupForTest)
+diff --git a/sdk/auth/filestore.go b/sdk/auth/filestore.go
+index 3f0f608..3fd699c 100644
+--- a/sdk/auth/filestore.go
++++ b/sdk/auth/filestore.go
+@@ -113,7 +113,7 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
+ 		if setter, ok := auth.Storage.(metadataSetter); ok {
+ 			setter.SetMetadata(auth.Metadata)
+ 		}
+-		if err = auth.Storage.SaveTokenToFile(path); err != nil {
++		if err = replaceFileAtomically(path, auth.Storage.SaveTokenToFile); err != nil {
+ 			return "", err
+ 		}
+ 	case auth.Metadata != nil:
+@@ -126,23 +126,19 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
+ 			if jsonEqual(existing, raw) {
+ 				return path, nil
+ 			}
+-			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+-			if errOpen != nil {
+-				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+-			}
+-			if _, errWrite := file.Write(raw); errWrite != nil {
+-				_ = file.Close()
+-				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+-			}
+-			if errClose := file.Close(); errClose != nil {
+-				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
++			if err = replaceFileAtomically(path, func(tempPath string) error {
++				return os.WriteFile(tempPath, raw, 0o600)
++			}); err != nil {
++				return "", err
+ 			}
+ 			return path, nil
+ 		} else if !os.IsNotExist(errRead) {
+ 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
+ 		}
+-		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+-			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
++		if err = replaceFileAtomically(path, func(tempPath string) error {
++			return os.WriteFile(tempPath, raw, 0o600)
++		}); err != nil {
++			return "", err
+ 		}
+ 	default:
+ 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
+@@ -162,6 +158,45 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
+ 	return path, nil
+ }
+ 
++func replaceFileAtomically(path string, write func(string) error) error {
++	dir := filepath.Dir(path)
++	temp, errCreate := os.CreateTemp(dir, ".auth-*.tmp")
++	if errCreate != nil {
++		return fmt.Errorf("auth filestore: create temp file failed: %w", errCreate)
++	}
++	tempPath := temp.Name()
++	defer func() {
++		_ = os.Remove(tempPath)
++	}()
++	if errClose := temp.Close(); errClose != nil {
++		return fmt.Errorf("auth filestore: close temp file failed: %w", errClose)
++	}
++	if errMode := os.Chmod(tempPath, 0o600); errMode != nil {
++		return fmt.Errorf("auth filestore: secure temp file failed: %w", errMode)
++	}
++	if errWrite := write(tempPath); errWrite != nil {
++		return fmt.Errorf("auth filestore: write temp file failed: %w", errWrite)
++	}
++	if errMode := os.Chmod(tempPath, 0o600); errMode != nil {
++		return fmt.Errorf("auth filestore: secure token file failed: %w", errMode)
++	}
++	syncFile, errOpen := os.Open(tempPath)
++	if errOpen != nil {
++		return fmt.Errorf("auth filestore: open temp file failed: %w", errOpen)
++	}
++	if errSync := syncFile.Sync(); errSync != nil {
++		_ = syncFile.Close()
++		return fmt.Errorf("auth filestore: sync temp file failed: %w", errSync)
++	}
++	if errClose := syncFile.Close(); errClose != nil {
++		return fmt.Errorf("auth filestore: close synced temp file failed: %w", errClose)
++	}
++	if errRename := os.Rename(tempPath, path); errRename != nil {
++		return fmt.Errorf("auth filestore: replace token file failed: %w", errRename)
++	}
++	return nil
++}
++
+ // List enumerates all auth JSON files under the configured directory.
+ func (s *FileTokenStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) {
+ 	dir := s.baseDirSnapshot()
+diff --git a/sdk/auth/filestore_oauth_safety_test.go b/sdk/auth/filestore_oauth_safety_test.go
+new file mode 100644
+index 0000000..23652a0
+--- /dev/null
++++ b/sdk/auth/filestore_oauth_safety_test.go
+@@ -0,0 +1,112 @@
++package auth
++
++import (
++	"context"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
++)
++
++type oauthSafetyTokenStorage struct {
++	payload  []byte
++	writeErr error
++	metadata map[string]any
++}
++
++func (s *oauthSafetyTokenStorage) SetMetadata(metadata map[string]any) {
++	s.metadata = metadata
++}
++
++func (s *oauthSafetyTokenStorage) SaveTokenToFile(path string) error {
++	if errWrite := os.WriteFile(path, s.payload, 0o666); errWrite != nil {
++		return errWrite
++	}
++	return s.writeErr
++}
++
++func TestFileTokenStoreOAuthRotationIsAtomicAndPrivate(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "codex.json")
++	if errWrite := os.WriteFile(path, []byte(`{"access_token":"old"}`), 0o644); errWrite != nil {
++		t.Fatalf("seed token file: %v", errWrite)
++	}
++
++	store := NewFileTokenStore()
++	store.SetBaseDir(dir)
++	auth := &cliproxyauth.Auth{
++		ID:       "codex.json",
++		Provider: "codex",
++		FileName: "codex.json",
++		Storage: &oauthSafetyTokenStorage{
++			payload: []byte(`{"access_token":"new","refresh_token":"rotated"}`),
++		},
++		Metadata: map[string]any{"type": "codex"},
++	}
++
++	if _, errSave := store.Save(context.Background(), auth); errSave != nil {
++		t.Fatalf("Save() error = %v", errSave)
++	}
++	got, errRead := os.ReadFile(path)
++	if errRead != nil {
++		t.Fatalf("read token file: %v", errRead)
++	}
++	if string(got) != `{"access_token":"new","refresh_token":"rotated"}` {
++		t.Fatalf("token file was not replaced with the complete payload")
++	}
++	info, errStat := os.Stat(path)
++	if errStat != nil {
++		t.Fatalf("stat token file: %v", errStat)
++	}
++	if gotMode := info.Mode().Perm(); gotMode != 0o600 {
++		t.Fatalf("token file mode = %04o, want 0600", gotMode)
++	}
++	assertNoOAuthSafetyTempFiles(t, dir)
++}
++
++func TestFileTokenStoreOAuthRotationFailureKeepsPreviousFile(t *testing.T) {
++	dir := t.TempDir()
++	path := filepath.Join(dir, "codex.json")
++	previous := []byte(`{"access_token":"still-valid"}`)
++	if errWrite := os.WriteFile(path, previous, 0o600); errWrite != nil {
++		t.Fatalf("seed token file: %v", errWrite)
++	}
++
++	store := NewFileTokenStore()
++	store.SetBaseDir(dir)
++	auth := &cliproxyauth.Auth{
++		ID:       "codex.json",
++		Provider: "codex",
++		FileName: "codex.json",
++		Storage: &oauthSafetyTokenStorage{
++			payload:  []byte(`{"access_token":"partial"`),
++			writeErr: errors.New("synthetic interrupted rotation"),
++		},
++		Metadata: map[string]any{"type": "codex"},
++	}
++
++	if _, errSave := store.Save(context.Background(), auth); errSave == nil {
++		t.Fatal("Save() error = nil, want interrupted rotation error")
++	}
++	got, errRead := os.ReadFile(path)
++	if errRead != nil {
++		t.Fatalf("read previous token file: %v", errRead)
++	}
++	if string(got) != string(previous) {
++		t.Fatal("failed rotation changed the previous token file")
++	}
++	assertNoOAuthSafetyTempFiles(t, dir)
++}
++
++func assertNoOAuthSafetyTempFiles(t *testing.T, dir string) {
++	t.Helper()
++	matches, errGlob := filepath.Glob(filepath.Join(dir, ".auth-*.tmp"))
++	if errGlob != nil {
++		t.Fatalf("glob temporary auth files: %v", errGlob)
++	}
++	if len(matches) != 0 {
++		t.Fatalf("temporary auth files remain after save: %d", len(matches))
++	}
++}
+diff --git a/sdk/cliproxy/auth/conductor_unauthorized_refresh_test.go b/sdk/cliproxy/auth/conductor_unauthorized_refresh_test.go
+index 3745192..03dbe1d 100644
+--- a/sdk/cliproxy/auth/conductor_unauthorized_refresh_test.go
++++ b/sdk/cliproxy/auth/conductor_unauthorized_refresh_test.go
+@@ -5,6 +5,7 @@ import (
+ 	"net/http"
+ 	"sync"
+ 	"testing"
++	"time"
+ 
+ 	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
+ 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+@@ -13,13 +14,16 @@ import (
+ type unauthorizedRefreshExecutor struct {
+ 	id string
+ 
+-	mu            sync.Mutex
+-	executeCalls  []string
+-	streamCalls   []string
+-	refreshCalls  int
+-	tokenInvalid  map[string]struct{}
+-	refreshFail   bool
+-	refreshTokens map[string]string
++	mu             sync.Mutex
++	executeCalls   []string
++	streamCalls    []string
++	refreshCalls   int
++	tokenInvalid   map[string]struct{}
++	refreshFail    bool
++	refreshTokens  map[string]string
++	refreshStarted chan struct{}
++	refreshRelease <-chan struct{}
++	refreshOnce    sync.Once
+ }
+ 
+ func (e *unauthorizedRefreshExecutor) Identifier() string { return e.id }
+@@ -59,11 +63,22 @@ func (e *unauthorizedRefreshExecutor) ExecuteStream(_ context.Context, auth *Aut
+ 
+ func (e *unauthorizedRefreshExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+ 	e.mu.Lock()
+-	defer e.mu.Unlock()
+ 	e.refreshCalls++
+-	if e.refreshFail {
++	refreshFail := e.refreshFail
++	refreshStarted := e.refreshStarted
++	refreshRelease := e.refreshRelease
++	e.mu.Unlock()
++	if refreshStarted != nil {
++		e.refreshOnce.Do(func() { close(refreshStarted) })
++	}
++	if refreshRelease != nil {
++		<-refreshRelease
++	}
++	if refreshFail {
+ 		return nil, &Error{HTTPStatus: http.StatusUnauthorized, Message: "refresh token invalid"}
+ 	}
++	e.mu.Lock()
++	defer e.mu.Unlock()
+ 	if auth.Metadata == nil {
+ 		auth.Metadata = make(map[string]any)
+ 	}
+@@ -334,3 +349,56 @@ func TestManager_Execute_UnauthorizedRefreshThenRetryStillFailsFallsBackOnce(t *
+ 		t.Fatalf("Execute calls = %v, want [primary, primary, backup]", got)
+ 	}
+ }
++
++func TestManager_ConcurrentStaleTokenRefreshesOnce(t *testing.T) {
++	started := make(chan struct{})
++	release := make(chan struct{})
++	auth := &Auth{
++		ID:       "codex-concurrent-refresh",
++		Provider: "codex",
++		Metadata: map[string]any{
++			"access_token":  "stale-access-token",
++			"refresh_token": "synthetic-refresh-token",
++		},
++	}
++	executor := &unauthorizedRefreshExecutor{
++		id:             "codex",
++		refreshTokens:  map[string]string{auth.ID: "fresh-access-token"},
++		refreshStarted: started,
++		refreshRelease: release,
++	}
++	manager := NewManager(nil, nil, nil)
++	manager.RegisterExecutor(executor)
++	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
++		t.Fatalf("register auth: %v", errRegister)
++	}
++
++	results := make(chan *Auth, 2)
++	errs := make(chan error, 2)
++	runRefresh := func() {
++		refreshed, errRefresh := manager.refreshAuthForRequest(context.Background(), auth.ID, "stale-access-token")
++		results <- refreshed
++		errs <- errRefresh
++	}
++	go runRefresh()
++	<-started
++	go runRefresh()
++	time.Sleep(20 * time.Millisecond)
++	if got := executor.RefreshCalls(); got != 1 {
++		t.Fatalf("Refresh calls before release = %d, want 1", got)
++	}
++	close(release)
++
++	for index := 0; index < 2; index++ {
++		if errRefresh := <-errs; errRefresh != nil {
++			t.Fatalf("refresh %d error = %v", index+1, errRefresh)
++		}
++		refreshed := <-results
++		if got := authAccessToken(refreshed); got != "fresh-access-token" {
++			t.Fatalf("refresh %d access token = %q, want refreshed token", index+1, got)
++		}
++	}
++	if got := executor.RefreshCalls(); got != 1 {
++		t.Fatalf("Refresh calls = %d, want 1", got)
++	}
++}

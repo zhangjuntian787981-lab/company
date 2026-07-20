@@ -1,0 +1,5 @@
+{
+  "name": "http_500",
+  "status": 500,
+  "json": {"error": {"type": "server_error", "code": "synthetic_500"}}
+}

@@ -1,0 +1,12 @@
+{
+  "name": "claude_code_mcp",
+  "status": 200,
+  "sse_events": [
+    {"event": "response.created", "data": {"type": "response.created", "response": {"id": "resp_mcp_call", "object": "response", "status": "in_progress", "model": "claude_code_mcp", "output": []}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 0, "item": {"id": "call_mcp_echo", "call_id": "call_mcp_echo", "type": "function_call", "status": "in_progress", "name": "mcp__compat__echo", "arguments": ""}}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_mcp_echo", "call_id": "call_mcp_echo", "output_index": 0, "delta": "{\"value\":\"ping\"}"}},
+    {"event": "response.function_call_arguments.done", "data": {"type": "response.function_call_arguments.done", "item_id": "call_mcp_echo", "call_id": "call_mcp_echo", "output_index": 0, "arguments": "{\"value\":\"ping\"}"}},
+    {"event": "response.output_item.done", "data": {"type": "response.output_item.done", "output_index": 0, "item": {"id": "call_mcp_echo", "call_id": "call_mcp_echo", "type": "function_call", "status": "completed", "name": "mcp__compat__echo", "arguments": "{\"value\":\"ping\"}"}}},
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "resp_mcp_call", "object": "response", "status": "completed", "model": "claude_code_mcp", "output": [{"id": "call_mcp_echo", "call_id": "call_mcp_echo", "type": "function_call", "status": "completed", "name": "mcp__compat__echo", "arguments": "{\"value\":\"ping\"}"}], "usage": {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}}}}
+  ]
+}

@@ -1,0 +1,80 @@
+name: Formal cloud soak
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: formal-cloud-soak
+  cancel-in-progress: false
+
+env:
+  COMPAT_PROD_BASELINE: baseline/cloud.lock.json
+  DISABLE_AUTOUPDATER: "1"
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26.5"
+          cache: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+          cache: false
+      - name: Install system and client tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lsof
+          npm install -g @anthropic-ai/claude-code@2.1.215 --no-audit --no-fund
+      - name: Bootstrap pinned upstream source
+        run: python3 scripts/bootstrap-cloud.py
+      - name: Pre-soak validation
+        run: |
+          make test
+          make check-prod
+          make source-boundary-check
+          make source-validation
+          make build-candidate
+          make candidate-bottle-check
+          make synthetic-oauth-check
+          make claude-code-e2e
+      - name: Run formal 7200-second soak
+        run: make soak-local
+      - name: Generate evidence-driven final report
+        if: always()
+        run: make final-report
+      - name: Upload sanitized formal reports
+        if: always()
+        uses: actions/upload-artifact@v5
+        with:
+          name: formal-cloud-soak-reports-${{ github.run_id }}
+          retention-days: 30
+          include-hidden-files: true
+          if-no-files-found: error
+          path: |
+            .runs/**/environment.json
+            .runs/**/cases.json
+            .runs/**/evidence.ndjson
+            .runs/**/junit.xml
+            .runs/**/rating.json
+            .runs/**/report.md
+            .runs/**/protocol-contracts.json
+            .runs/**/protocol-contracts.md
+            .runs/**/source-validation.json
+            .runs/**/candidate-build.json
+            .runs/**/synthetic-oauth.json
+            .runs/**/claude-code-e2e.json
+            .runs/**/claude-code-e2e.md
+            .runs/**/soak.json
+            .runs/**/final-report.json
+            .runs/**/final-report.md

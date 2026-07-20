@@ -1,0 +1,119 @@
+diff --git a/internal/translator/codex/claude/codex_claude_response.go b/internal/translator/codex/claude/codex_claude_response.go
+--- a/internal/translator/codex/claude/codex_claude_response.go
++++ b/internal/translator/codex/claude/codex_claude_response.go
+@@ -178,13 +178,11 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 		case "function_call":
+ 			output = append(output, finalizeCodexThinkingBlock(params)...)
+ 			output = append(output, stopCodexTextBlock(params)...)
+-			call, conflict := recordCodexFunctionCall(params, rootResult, itemResult)
++			_, conflict := recordCodexFunctionCall(params, rootResult, itemResult)
+ 			if conflict {
+ 				params.FunctionCallProtocolErr = true
+ 				output = append(output, codexFunctionCallProtocolError()...)
+-				break
+ 			}
+-			output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
+ 		case "reasoning":
+ 			params.ThinkingSummarySeen = false
+ 			params.ThinkingSignature = itemResult.Get("encrypted_content").String()
+@@ -239,9 +237,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 				call.Arguments = itemResult.Get("arguments").String()
+ 			}
+ 			call.ItemDone = true
+-			output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
+-			output = flushCodexFunctionCallArguments(output, call)
+-			output = stopCodexFunctionCall(output, call)
++			output = appendReadyCodexFunctionCalls(output, params, originalRequestRawJSON)
+ 		case "reasoning":
+ 			if signature := itemResult.Get("encrypted_content").String(); signature != "" {
+ 				params.ThinkingSignature = signature
+@@ -266,10 +262,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 		delta := rootResult.Get("delta").String()
+ 		call.HasReceivedArgumentsDelta = true
+ 		call.Arguments += delta
+-		if call.StartEmitted && !call.StopEmitted {
+-			output = appendCodexFunctionCallArgumentDelta(output, delta, call.BlockIndex)
+-			call.ArgumentsEmitted = true
+-		}
+ 	case "response.function_call_arguments.done":
+ 		call := codexFunctionCallForArguments(params, rootResult)
+ 		if call == nil {
+@@ -279,7 +271,6 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 		}
+ 		if !call.HasReceivedArgumentsDelta {
+ 			call.Arguments = rootResult.Get("arguments").String()
+-			output = flushCodexFunctionCallArguments(output, call)
+ 		}
+ 		call.ArgumentsDone = true
+ 	}
+@@ -717,6 +708,24 @@ func appendCodexFunctionCallsFromTerminal(output []byte, params *ConvertCodexRes
+ 	return output
+ }
+ 
++func appendReadyCodexFunctionCalls(output []byte, params *ConvertCodexResponseToClaudeParams, originalRequestRawJSON []byte) []byte {
++	if params == nil {
++		return output
++	}
++	for _, call := range params.FunctionCallOrder {
++		if call == nil || call.StopEmitted {
++			continue
++		}
++		if !call.ItemDone || call.Name == "" {
++			break
++		}
++		output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
++		output = flushCodexFunctionCallArguments(output, call)
++		output = stopCodexFunctionCall(output, call)
++	}
++	return output
++}
++
+ func clearCodexFunctionCalls(params *ConvertCodexResponseToClaudeParams) {
+ 	if params == nil {
+ 		return
+diff --git a/internal/translator/codex/claude/codex_claude_response_test.go b/internal/translator/codex/claude/codex_claude_response_test.go
+--- a/internal/translator/codex/claude/codex_claude_response_test.go
++++ b/internal/translator/codex/claude/codex_claude_response_test.go
+@@ -667,6 +667,7 @@ func TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIso
+ 	toolIDs := map[int64]string{}
+ 	arguments := map[int64]string{}
+ 	stops := map[int64]int{}
++	var toolEventOrder []string
+ 	for _, chunk := range chunks {
+ 		for _, out := range ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, chunk, &param) {
+ 			for _, line := range strings.Split(string(out), "\n") {
+@@ -679,13 +680,16 @@ func TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIso
+ 				case "content_block_start":
+ 					if data.Get("content_block.type").String() == "tool_use" {
+ 						toolIDs[index] = data.Get("content_block.id").String()
++						toolEventOrder = append(toolEventOrder, data.Get("content_block.id").String()+":start")
+ 					}
+ 				case "content_block_delta":
+ 					if data.Get("delta.type").String() == "input_json_delta" {
+ 						arguments[index] += data.Get("delta.partial_json").String()
++						toolEventOrder = append(toolEventOrder, toolIDs[index]+":delta")
+ 					}
+ 				case "content_block_stop":
+ 					stops[index]++
++					toolEventOrder = append(toolEventOrder, toolIDs[index]+":stop")
+ 				}
+ 			}
+ 		}
+@@ -696,6 +700,9 @@ func TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIso
+ 	}
+ 	if toolIDs[1] != "call_b" || arguments[1] != `{"value":"beta","n":2}` || stops[1] != 1 {
+ 		t.Fatalf("call_b state crossed calls: ids=%v arguments=%v stops=%v", toolIDs, arguments, stops)
++	}
++	if got, want := strings.Join(toolEventOrder, ","), "call_a:start,call_a:delta,call_a:stop,call_b:start,call_b:delta,call_b:stop"; got != want {
++		t.Fatalf("tool blocks overlapped: got %s, want %s", got, want)
+ 	}
+ }
+ 
+@@ -1149,6 +1156,7 @@ func TestConvertCodexResponseToClaude_ShortensLongToolUseIDs(t *testing.T) {
+ 		var param any
+ 
+ 		outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.output_item.added","item":{"type":"function_call","call_id":"`+longCallID+`","name":"lookup"}}`), &param)
++		outputs = append(outputs, ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte(`data: {"type":"response.output_item.done","item":{"type":"function_call","call_id":"`+longCallID+`","name":"lookup","arguments":"{}"}}`), &param)...)
+ 
+ 		toolID := ""
+ 		for _, out := range outputs {

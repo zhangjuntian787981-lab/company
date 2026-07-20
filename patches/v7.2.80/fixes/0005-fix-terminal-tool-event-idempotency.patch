@@ -1,0 +1,205 @@
+diff --git a/internal/translator/codex/claude/codex_claude_response.go b/internal/translator/codex/claude/codex_claude_response.go
+index 589ee0f..ee16d87 100644
+--- a/internal/translator/codex/claude/codex_claude_response.go
++++ b/internal/translator/codex/claude/codex_claude_response.go
+@@ -37,6 +37,7 @@ type ConvertCodexResponseToClaudeParams struct {
+ 	FunctionCalls           map[string]*codexFunctionCallState
+ 	FunctionCallOrder       []*codexFunctionCallState
+ 	FunctionCallProtocolErr bool
++	TerminalSeen            bool
+ }
+ 
+ type codexFunctionCallState struct {
+@@ -48,6 +49,8 @@ type codexFunctionCallState struct {
+ 	BlockIndex                int
+ 	HasReceivedArgumentsDelta bool
+ 	ArgumentsEmitted          bool
++	ArgumentsDone             bool
++	ItemDone                  bool
+ 	StartEmitted              bool
+ 	StopEmitted               bool
+ }
+@@ -83,17 +86,20 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 	output := make([]byte, 0, 512)
+ 	rootResult := gjson.ParseBytes(rawJSON)
+ 	params := (*param).(*ConvertCodexResponseToClaudeParams)
++	typeStr := rootResult.Get("type").String()
++	if params.TerminalSeen {
++		return [][]byte{output}
++	}
+ 	if params.ThinkingBlockOpen && params.ThinkingStopPending {
+-		switch rootResult.Get("type").String() {
++		switch typeStr {
+ 		case "response.content_part.added", "response.completed", "response.incomplete":
+ 			output = append(output, finalizeCodexThinkingBlock(params)...)
+ 		}
+ 	}
+ 
+-	typeResult := rootResult.Get("type")
+-	typeStr := typeResult.String()
+ 	if params.FunctionCallProtocolErr {
+ 		if typeStr == "response.completed" || typeStr == "response.incomplete" {
++			params.TerminalSeen = true
+ 			clearCodexFunctionCalls(params)
+ 		}
+ 		return [][]byte{output}
+@@ -143,6 +149,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 	case "response.web_search_call.searching", "response.web_search_call.completed", "response.web_search_call.in_progress":
+ 		// Wait for populated web_search_call items on output_item.done.
+ 	case "response.completed", "response.incomplete":
++		params.TerminalSeen = true
+ 		template = []byte(`{"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"input_tokens":0,"output_tokens":0}}`)
+ 		responseData := rootResult.Get("response")
+ 		hydrateCodexFunctionCallsFromTerminal(params, responseData)
+@@ -231,6 +238,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 			if !call.HasReceivedArgumentsDelta {
+ 				call.Arguments = itemResult.Get("arguments").String()
+ 			}
++			call.ItemDone = true
+ 			output = startCodexFunctionCall(output, params, originalRequestRawJSON, call)
+ 			output = flushCodexFunctionCallArguments(output, call)
+ 			output = stopCodexFunctionCall(output, call)
+@@ -273,6 +281,7 @@ func ConvertCodexResponseToClaude(_ context.Context, _ string, originalRequestRa
+ 			call.Arguments = rootResult.Get("arguments").String()
+ 			output = flushCodexFunctionCallArguments(output, call)
+ 		}
++		call.ArgumentsDone = true
+ 	}
+ 
+ 	return [][]byte{output}
+@@ -590,7 +599,7 @@ func codexFunctionCallForArguments(params *ConvertCodexResponseToClaudeParams, r
+ 	}
+ 
+ 	var call *codexFunctionCallState
+-	for _, key := range codexFunctionCallAliasKeys(rootResult, gjson.Result{}) {
++	for _, key := range codexFunctionCallAliasKeys(rootResult, rootResult.Get("item")) {
+ 		candidate := params.FunctionCalls[key]
+ 		if candidate == nil {
+ 			continue
+diff --git a/internal/translator/codex/claude/codex_claude_response_test.go b/internal/translator/codex/claude/codex_claude_response_test.go
+index dc373c7..bd0c212 100644
+--- a/internal/translator/codex/claude/codex_claude_response_test.go
++++ b/internal/translator/codex/claude/codex_claude_response_test.go
+@@ -3,6 +3,7 @@ package claude
+ import (
+ 	"bytes"
+ 	"context"
++	"math/rand"
+ 	"strings"
+ 	"testing"
+ 
+@@ -698,6 +699,114 @@ func TestConvertCodexResponseToClaude_StreamInterleavedNamedFunctionCallsStayIso
+ 	}
+ }
+ 
++func TestConvertCodexResponseToClaude_StreamThreeCallsNestedAliasesAndDuplicateTerminalAreIdempotent(t *testing.T) {
++	ctx := context.Background()
++	originalRequest := []byte(`{"tools":[{"name":"alpha_tool"},{"name":"beta_tool"},{"name":"gamma_tool"}]}`)
++	var param any
++
++	chunks := []string{
++		`{"type":"response.created","response":{"id":"resp_1","model":"gpt-5"}}`,
++		`{"type":"response.reasoning_summary_part.added"}`,
++		`{"type":"response.reasoning_summary_text.delta","delta":"check calls"}`,
++		`{"type":"response.reasoning_summary_part.done"}`,
++		`{"type":"response.output_item.done","item":{"type":"reasoning","encrypted_content":"sig"}}`,
++		`{"type":"response.content_part.added","part":{"type":"output_text"}}`,
++		`{"type":"response.output_text.delta","delta":"running tools"}`,
++		`{"type":"response.output_item.added","output_index":10,"item":{"id":"item_a","type":"function_call","call_id":"call_a","name":"alpha_tool"}}`,
++		`{"type":"response.output_item.added","output_index":11,"item":{"id":"item_b","type":"function_call","call_id":"call_b","name":"beta_tool"}}`,
++		`{"type":"response.output_item.added","output_index":12,"item":{"id":"item_c","type":"function_call","call_id":"call_c","name":"gamma_tool"}}`,
++	}
++
++	rng := rand.New(rand.NewSource(73421))
++	deltaRounds := [][]string{
++		{
++			`{"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"{\"value\":\"a"}`,
++			`{"type":"response.function_call_arguments.delta","item":{"call_id":"call_b"},"delta":"{\"value\":\"b"}`,
++			`{"type":"response.function_call_arguments.delta","item":{"id":"item_c"},"delta":"{\"value\":\"g"}`,
++		},
++		{
++			`{"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"lpha\"}"}`,
++			`{"type":"response.function_call_arguments.delta","item":{"call_id":"call_b"},"delta":"eta\"}"}`,
++			`{"type":"response.function_call_arguments.delta","item":{"id":"item_c"},"delta":"amma\"}"}`,
++		},
++	}
++	for _, round := range deltaRounds {
++		rng.Shuffle(len(round), func(i, j int) { round[i], round[j] = round[j], round[i] })
++		chunks = append(chunks, round...)
++	}
++
++	doneEvents := []string{
++		`{"type":"response.function_call_arguments.done","call_id":"call_a","arguments":"{\"value\":\"alpha\"}"}`,
++		`{"type":"response.output_item.done","output_index":10,"item":{"id":"item_a","type":"function_call","call_id":"call_a","name":"alpha_tool","arguments":"{\"value\":\"alpha\"}"}}`,
++		`{"type":"response.output_item.done","output_index":11,"item":{"id":"item_b","type":"function_call","call_id":"call_b","name":"beta_tool","arguments":"{\"value\":\"beta\"}"}}`,
++		`{"type":"response.function_call_arguments.done","item":{"call_id":"call_b"},"arguments":"{\"value\":\"beta\"}"}`,
++		`{"type":"response.function_call_arguments.done","item":{"id":"item_c"},"arguments":"{\"value\":\"gamma\"}"}`,
++		`{"type":"response.output_item.done","output_index":12,"item":{"id":"item_c","type":"function_call","call_id":"call_c","name":"gamma_tool","arguments":"{\"value\":\"gamma\"}"}}`,
++	}
++	rng.Shuffle(len(doneEvents), func(i, j int) { doneEvents[i], doneEvents[j] = doneEvents[j], doneEvents[i] })
++	chunks = append(chunks, doneEvents...)
++
++	terminal := `{"type":"response.completed","response":{"stop_reason":"stop","usage":{"input_tokens":1,"output_tokens":1},"output":[{"type":"function_call","id":"item_a","call_id":"call_a","name":"alpha_tool","arguments":"{\"value\":\"alpha\"}"},{"type":"function_call","id":"item_b","call_id":"call_b","name":"beta_tool","arguments":"{\"value\":\"beta\"}"},{"type":"function_call","id":"item_c","call_id":"call_c","name":"gamma_tool","arguments":"{\"value\":\"gamma\"}"}]}}`
++	chunks = append(chunks, terminal, terminal)
++	chunks = append(chunks, `{"type":"response.function_call_arguments.delta","call_id":"call_a","delta":"late"}`)
++
++	indexToID := map[int64]string{}
++	argumentsByID := map[string]string{}
++	stopsByID := map[string]int{}
++	messageDeltaCount := 0
++	messageStopCount := 0
++	for _, chunk := range chunks {
++		outputs := ConvertCodexResponseToClaude(ctx, "", originalRequest, nil, []byte("data: "+chunk), &param)
++		for _, out := range outputs {
++			for _, line := range strings.Split(string(out), "\n") {
++				if !strings.HasPrefix(line, "data: ") {
++					continue
++				}
++				data := gjson.Parse(strings.TrimPrefix(line, "data: "))
++				index := data.Get("index").Int()
++				switch data.Get("type").String() {
++				case "content_block_start":
++					if data.Get("content_block.type").String() == "tool_use" {
++						indexToID[index] = data.Get("content_block.id").String()
++					}
++				case "content_block_delta":
++					if data.Get("delta.type").String() == "input_json_delta" {
++						argumentsByID[indexToID[index]] += data.Get("delta.partial_json").String()
++					}
++				case "content_block_stop":
++					if id := indexToID[index]; id != "" {
++						stopsByID[id]++
++					}
++				case "message_delta":
++					messageDeltaCount++
++				case "message_stop":
++					messageStopCount++
++				}
++			}
++		}
++	}
++
++	wantArguments := map[string]string{
++		"call_a": `{"value":"alpha"}`,
++		"call_b": `{"value":"beta"}`,
++		"call_c": `{"value":"gamma"}`,
++	}
++	if len(indexToID) != 3 {
++		t.Fatalf("tool start count = %d, want 3; indices=%v", len(indexToID), indexToID)
++	}
++	for id, want := range wantArguments {
++		if got := argumentsByID[id]; got != want {
++			t.Fatalf("arguments for %s = %q, want %q; all=%v", id, got, want, argumentsByID)
++		}
++		if stopsByID[id] != 1 {
++			t.Fatalf("tool stop count for %s = %d, want 1; all=%v", id, stopsByID[id], stopsByID)
++		}
++	}
++	if messageDeltaCount != 1 || messageStopCount != 1 {
++		t.Fatalf("terminal events were not idempotent: message_delta=%d message_stop=%d", messageDeltaCount, messageStopCount)
++	}
++}
++
+ func TestConvertCodexResponseToClaude_StreamArgumentDeltasResolveByCallAndItemID(t *testing.T) {
+ 	ctx := context.Background()
+ 	originalRequest := []byte(`{"tools":[{"name":"lookup"}]}`)

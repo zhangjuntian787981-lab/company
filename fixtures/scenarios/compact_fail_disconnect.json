@@ -1,0 +1,9 @@
+{
+  "name": "compact_fail_disconnect",
+  "sequence": [
+    "compact_after",
+    "compact_after",
+    "disconnect",
+    "compact_text_low"
+  ]
+}

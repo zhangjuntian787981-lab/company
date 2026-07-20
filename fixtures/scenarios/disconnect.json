@@ -1,0 +1,12 @@
+{
+  "name": "disconnect",
+  "status": 200,
+  "disconnect_after_events": 4,
+  "sse_events": [
+    {"event": "response.created", "data": {"type": "response.created", "response": {"id": "resp_disconnect", "object": "response", "status": "in_progress", "model": "disconnect", "output": []}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 0, "item": {"id": "msg_disconnect", "type": "message", "status": "in_progress", "role": "assistant", "content": []}}},
+    {"event": "response.content_part.added", "data": {"type": "response.content_part.added", "item_id": "msg_disconnect", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}}},
+    {"event": "response.output_text.delta", "data": {"type": "response.output_text.delta", "item_id": "msg_disconnect", "output_index": 0, "content_index": 0, "delta": "partial"}},
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "never_sent", "status": "completed"}}}
+  ]
+}

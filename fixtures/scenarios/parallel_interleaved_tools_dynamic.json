@@ -1,0 +1,19 @@
+{
+  "name": "parallel_interleaved_tools_dynamic",
+  "status": 200,
+  "request_hash_placeholders": true,
+  "sse_events": [
+    {"event": "response.created", "data": {"type": "response.created", "response": {"id": "resp_parallel_{{request_sha12}}", "object": "response", "status": "in_progress", "model": "parallel_interleaved_tools_dynamic", "output": []}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 0, "item": {"id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "type": "function_call", "status": "in_progress", "name": "compat.echo", "arguments": ""}}},
+    {"event": "response.output_item.added", "data": {"type": "response.output_item.added", "output_index": 1, "item": {"id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "type": "function_call", "status": "in_progress", "name": "compat.add", "arguments": ""}}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "output_index": 0, "delta": "{\"value\":\"al"}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "output_index": 1, "delta": "{\"value\":\"be"}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "output_index": 0, "delta": "pha\",\"n\":1}"}},
+    {"event": "response.function_call_arguments.delta", "data": {"type": "response.function_call_arguments.delta", "item_id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "output_index": 1, "delta": "ta\",\"n\":2}"}},
+    {"event": "response.function_call_arguments.done", "data": {"type": "response.function_call_arguments.done", "item_id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "output_index": 0, "arguments": "{\"value\":\"alpha\",\"n\":1}"}},
+    {"event": "response.function_call_arguments.done", "data": {"type": "response.function_call_arguments.done", "item_id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "output_index": 1, "arguments": "{\"value\":\"beta\",\"n\":2}"}},
+    {"event": "response.output_item.done", "data": {"type": "response.output_item.done", "output_index": 0, "item": {"id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "type": "function_call", "status": "completed", "name": "compat.echo", "arguments": "{\"value\":\"alpha\",\"n\":1}"}}},
+    {"event": "response.output_item.done", "data": {"type": "response.output_item.done", "output_index": 1, "item": {"id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "type": "function_call", "status": "completed", "name": "compat.add", "arguments": "{\"value\":\"beta\",\"n\":2}"}}},
+    {"event": "response.completed", "data": {"type": "response.completed", "response": {"id": "resp_parallel_{{request_sha12}}", "object": "response", "status": "completed", "model": "parallel_interleaved_tools_dynamic", "output": [{"id": "call_alpha_{{request_sha12}}", "call_id": "call_alpha_{{request_sha12}}", "type": "function_call", "status": "completed", "name": "compat.echo", "arguments": "{\"value\":\"alpha\",\"n\":1}"}, {"id": "call_beta_{{request_sha12}}", "call_id": "call_beta_{{request_sha12}}", "type": "function_call", "status": "completed", "name": "compat.add", "arguments": "{\"value\":\"beta\",\"n\":2}"}], "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20}}}}
+  ]
+}

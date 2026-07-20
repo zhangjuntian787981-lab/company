@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "default": "deny",
+  "allowed_destinations": [
+    {"host": "127.0.0.1", "ports": "dynamic-high-port-only"},
+    {"host": "localhost", "ports": "dynamic-high-port-only"}
+  ],
+  "forbidden": [
+    {"host": "127.0.0.1", "port": 8317, "reason": "production baseline"},
+    {"host": "localhost", "port": 8317, "reason": "production baseline"},
+    {"destination": "non-loopback", "reason": "real network requires separate approval"}
+  ],
+  "default_runner_enforcement": [
+    "URL allowlist validation",
+    "non-loopback proxy environment replaced with a closed loopback endpoint",
+    "NO_PROXY restricted to loopback",
+    "local-model mode for bottle integration",
+    "generated config with loopback Codex base URL",
+    "synthetic credentials only"
+  ],
+  "os_firewall_enforcement": "UNVERIFIED"
+}
