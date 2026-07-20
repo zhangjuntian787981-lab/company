@@ -34,7 +34,9 @@ from harness.runner import (
     wait_for_ready,
 )
 
-CLAUDE_BINARY = resolve_executable("COMPAT_CLAUDE_BINARY", None, "claude")
+CLAUDE_BINARY = resolve_executable(
+    "COMPAT_CLAUDE_BINARY", REPO_ROOT / ".tools" / "claude" / "bin" / "claude", "claude"
+)
 LOGIN_SHELL_BINARY = resolve_executable("COMPAT_LOGIN_SHELL_BINARY", Path("/bin/zsh"), "bash")
 CLAUDE_SAFE_WRAPPER = REPO_ROOT / "scripts" / "claude-safe-wrapper.py"
 MCP_SERVER = REPO_ROOT / "harness" / "synthetic_mcp_server.py"

@@ -11,7 +11,7 @@ SCRIPT = ROOT / "scripts" / "setup-cloud.sh"
 
 
 class SetupCloudTests(unittest.TestCase):
-    def test_mise_go_is_pinned_for_non_interactive_shells(self):
+    def test_mise_tools_are_pinned_for_non_interactive_shells(self):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "project"
             scripts = project / "scripts"
@@ -36,18 +36,24 @@ class SetupCloudTests(unittest.TestCase):
                 "case \"$*\" in\n"
                 "  'install go@1.26.5'|'use --global go@1.26.5') ;;\n"
                 "  'which go --tool=go@1.26.5') printf '%s\\n' \"$FAKE_MISE_GO\" ;;\n"
+                "  'install node@22') ;;\n"
+                "  \"exec node@22 -- npm install -g @anthropic-ai/claude-code@2.1.215 --prefix $FAKE_CLAUDE_PREFIX --no-audit --no-fund\")\n"
+                "    mkdir -p \"$(dirname -- \"$FAKE_PINNED_CLAUDE\")\"\n"
+                "    printf '%s\\n' '#!/bin/sh' \"echo '2.1.215 (Claude Code)'\" > \"$FAKE_PINNED_CLAUDE\"\n"
+                "    chmod 700 \"$FAKE_PINNED_CLAUDE\"\n"
+                "    ;;\n"
                 "  *) echo \"unexpected mise arguments: $*\" >&2; exit 2 ;;\n"
                 "esac\n",
-            )
-            self.write_executable(
-                fake_bin / "claude",
-                "#!/bin/sh\necho '2.1.215 (Claude Code)'\n",
             )
             self.write_executable(fake_bin / "python3", "#!/bin/sh\nexit 0\n")
 
             environment = os.environ.copy()
             environment["PATH"] = "%s:/usr/bin:/bin" % fake_bin
             environment["FAKE_MISE_GO"] = str(mise_go)
+            environment["FAKE_CLAUDE_PREFIX"] = str(project / ".tools" / "claude")
+            environment["FAKE_PINNED_CLAUDE"] = str(
+                project / ".tools" / "claude" / "bin" / "claude"
+            )
             result = subprocess.run(
                 ["/bin/sh", str(scripts / SCRIPT.name)],
                 env=environment,
@@ -60,8 +66,10 @@ class SetupCloudTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             pinned_go = project / ".tools" / "go" / "bin" / "go"
             pinned_gofmt = project / ".tools" / "go" / "bin" / "gofmt"
+            pinned_claude = project / ".tools" / "claude" / "bin" / "claude"
             self.assertTrue(pinned_go.is_symlink())
             self.assertTrue(pinned_gofmt.is_symlink())
+            self.assertTrue(pinned_claude.is_file())
             self.assertEqual(pinned_go.resolve(), mise_go.resolve())
             self.assertEqual(pinned_gofmt.resolve(), mise_gofmt.resolve())
             version = subprocess.run(
@@ -71,6 +79,13 @@ class SetupCloudTests(unittest.TestCase):
                 check=True,
             ).stdout
             self.assertIn("go1.26.5", version)
+            claude_version = subprocess.run(
+                [str(pinned_claude), "--version"],
+                text=True,
+                stdout=subprocess.PIPE,
+                check=True,
+            ).stdout
+            self.assertIn("2.1.215", claude_version)
 
     @staticmethod
     def write_executable(path: Path, content: str) -> None:

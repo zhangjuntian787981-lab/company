@@ -20,7 +20,9 @@ from harness.redaction import assert_report_files_safe
 from harness.runner import REPO_ROOT, case_result, read_sse_response, unverified
 from harness.toolchain import resolve_executable
 
-CLAUDE_BINARY = resolve_executable("COMPAT_CLAUDE_BINARY", None, "claude")
+CLAUDE_BINARY = resolve_executable(
+    "COMPAT_CLAUDE_BINARY", REPO_ROOT / ".tools" / "claude" / "bin" / "claude", "claude"
+)
 MCP_SERVER = REPO_ROOT / "harness" / "synthetic_mcp_server.py"
 RUNS_DIR = REPO_ROOT / ".runs"
 MODEL = "gpt-5.6-sol"
