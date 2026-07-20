@@ -3,9 +3,11 @@ set -eu
 
 PROJECT_ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 GO_VERSION=1.26.5
+NODE_VERSION=22
 CLAUDE_CODE_VERSION=2.1.215
 PINNED_GO="$PROJECT_ROOT/.tools/go/bin/go"
 PINNED_GOFMT="$PROJECT_ROOT/.tools/go/bin/gofmt"
+PINNED_CLAUDE="$PROJECT_ROOT/.tools/claude/bin/claude"
 
 if [ -x "$PINNED_GO" ] && [ -x "$PINNED_GOFMT" ]; then
     GO_BINARY=$PINNED_GO
@@ -33,8 +35,17 @@ if [ "$GOFMT_BINARY" != "$PINNED_GOFMT" ]; then
     ln -sf "$GOFMT_BINARY" "$PINNED_GOFMT"
 fi
 
-if ! claude --version 2>/dev/null | grep -q "${CLAUDE_CODE_VERSION}"; then
-    npm install -g "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" --no-audit --no-fund
+if ! "$PINNED_CLAUDE" --version 2>/dev/null | grep -q "${CLAUDE_CODE_VERSION}"; then
+    mise install "node@${NODE_VERSION}"
+    mise exec "node@${NODE_VERSION}" -- npm install -g \
+        "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
+        --prefix "$PROJECT_ROOT/.tools/claude" \
+        --no-audit \
+        --no-fund
+fi
+if ! "$PINNED_CLAUDE" --version 2>/dev/null | grep -q "${CLAUDE_CODE_VERSION}"; then
+    echo "Claude Code ${CLAUDE_CODE_VERSION} is unavailable: $PINNED_CLAUDE" >&2
+    exit 1
 fi
 
 cd "$PROJECT_ROOT"
