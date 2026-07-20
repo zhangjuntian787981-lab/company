@@ -79,12 +79,14 @@ def dependency_environment() -> dict[str, str]:
 
 
 def prepare_vendor(repository: str, source_commit: str) -> None:
+    created = False
     if not (VENDOR / ".git").exists():
         VENDOR.parent.mkdir(parents=True, exist_ok=True)
         run_checked([str(GIT), "clone", "--no-checkout", repository, str(VENDOR)])
+        created = True
     if git_output("remote", "get-url", "origin") != repository:
         raise RuntimeError("vendor origin does not match manifest source_repository")
-    if git_output("status", "--porcelain"):
+    if not created and git_output("status", "--porcelain"):
         raise RuntimeError("vendor checkout is not clean")
     run_checked([str(GIT), "-C", str(VENDOR), "fetch", "--depth=1", "origin", source_commit])
     run_checked([str(GIT), "-C", str(VENDOR), "checkout", "--detach", source_commit])

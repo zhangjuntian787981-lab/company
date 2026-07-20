@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -16,6 +17,15 @@ SPEC.loader.exec_module(MODULE)
 
 
 class ClaudeCodeE2ETests(unittest.TestCase):
+    def test_login_shell_launcher_uses_resolved_binary(self) -> None:
+        with mock.patch.object(MODULE, "LOGIN_SHELL_BINARY", Path("/bin/bash")):
+            argv = MODULE.launcher_argv(["wrapper", "--version"], "login-shell")
+
+        self.assertEqual(
+            argv,
+            ["/bin/bash", "-lc", 'exec "$@"', "claude-safe-wrapper", "wrapper", "--version"],
+        )
+
     def test_stream_json_input_has_one_user_record_per_turn(self) -> None:
         payload = MODULE.stream_json_input(["first", "second"]).decode("utf-8")
         records = [json.loads(line) for line in payload.splitlines()]
