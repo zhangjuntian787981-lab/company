@@ -35,6 +35,7 @@ from harness.runner import (
 )
 
 CLAUDE_BINARY = resolve_executable("COMPAT_CLAUDE_BINARY", None, "claude")
+LOGIN_SHELL_BINARY = resolve_executable("COMPAT_LOGIN_SHELL_BINARY", Path("/bin/zsh"), "bash")
 CLAUDE_SAFE_WRAPPER = REPO_ROOT / "scripts" / "claude-safe-wrapper.py"
 MCP_SERVER = REPO_ROOT / "harness" / "synthetic_mcp_server.py"
 RUNS_DIR = REPO_ROOT / ".runs"
@@ -206,8 +207,8 @@ def run_stream_process(
 def launcher_argv(wrapper_argv: Sequence[str], launcher: str) -> List[str]:
     if launcher in {"direct", "minimal-env"}:
         return list(wrapper_argv)
-    if launcher == "zsh-login":
-        return ["/bin/zsh", "-lc", 'exec "$@"', "claude-safe-wrapper", *wrapper_argv]
+    if launcher == "login-shell":
+        return [str(LOGIN_SHELL_BINARY), "-lc", 'exec "$@"', "claude-safe-wrapper", *wrapper_argv]
     raise ValueError("unsupported Claude launcher: %s" % launcher)
 
 
@@ -818,7 +819,7 @@ def run(
         def launcher_parity() -> Mapping[str, Any]:
             modes = [
                 ("direct-absolute", "direct", dict(claude_env)),
-                ("zsh-login", "zsh-login", dict(claude_env)),
+                ("login-shell", "login-shell", dict(claude_env)),
                 ("gui-minimal-env", "minimal-env", minimal_launcher_environment(claude_env)),
             ]
             observations: Dict[str, Dict[str, Any]] = {}
