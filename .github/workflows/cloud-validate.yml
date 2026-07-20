@@ -3,6 +3,7 @@ name: Cloud validation
 on:
   push:
     branches: [main]
+  pull_request:
   workflow_dispatch:
 
 permissions:
@@ -32,7 +33,6 @@ jobs:
       - uses: actions/setup-node@v6
         with:
           node-version: "22"
-          cache: false
       - name: Install system and client tools
         run: |
           sudo apt-get update
@@ -63,7 +63,7 @@ jobs:
           name: cloud-validation-reports-${{ github.run_id }}
           retention-days: 14
           include-hidden-files: true
-          if-no-files-found: error
+          if-no-files-found: warn
           path: |
             .runs/**/environment.json
             .runs/**/cases.json
